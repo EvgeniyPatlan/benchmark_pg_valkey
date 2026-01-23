@@ -5,7 +5,7 @@ echo "Installing Valkey 8..."
 
 # Install dependencies
 sudo apt-get update
-sudo apt-get install -y build-essential tcl pkg-config libssl-dev
+sudo apt-get install -y build-essential tcl pkg-config libssl-dev pip3
 
 # Download and compile Valkey
 cd /tmp

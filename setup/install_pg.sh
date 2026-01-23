@@ -10,6 +10,7 @@ wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-
 
 # Update and install
 sudo apt-get update
+sudo apt install -y pip3
 sudo apt-get install -y postgresql-16 postgresql-contrib-16 postgresql-client-16
 
 # Configure PostgreSQL for performance

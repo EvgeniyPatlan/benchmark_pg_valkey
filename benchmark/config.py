@@ -24,21 +24,31 @@ VALKEY_CONFIG = {
 BENCHMARK = {
     # Producer settings
     'production_rate': 1000,  # jobs per second
-    'production_duration': 180,  # seconds (5 minutes)
+    'production_duration': 180,  # seconds
     'total_jobs': None,  # calculated as rate * duration
     
     # Job settings
     'job_size_bytes': 512,  # payload size
     'job_processing_time_ms': 5,  # simulated processing time
     
-    # Worker settings
-    'num_workers': 20,  # concurrent workers
-    'worker_batch_size': 1,  # jobs per fetch
-    'worker_poll_interval_ms': 10,  # polling interval
+    # Worker settings - DIFFERENT FOR PG vs VALKEY
+    'num_workers': 10,  # concurrent workers
+    
+    # PostgreSQL worker settings (row-level granularity)
+    'pg_worker_batch_size': 1,  # PG works well with single-row fetches
+    'pg_worker_poll_interval_ms': 10,  # fast polling for PG
+    
+    # Valkey worker settings (stream-level granularity - needs batching!)
+    'valkey_worker_batch_size': 50,  # Fetch 50 messages per XREADGROUP call
+    'valkey_worker_poll_interval_ms': 100,  # Longer block time for batching
+    
+    # For backwards compatibility, keep old field but mark as deprecated
+    'worker_batch_size': 1,  # DEPRECATED: use pg_worker_batch_size or valkey_worker_batch_size
+    'worker_poll_interval_ms': 10,  # DEPRECATED
     
     # Test scenarios
     'scenarios': ['cold', 'warm', 'load'],
-    'warmup_duration': 300,  # seconds before warm test
+    'warmup_duration': 60,  # seconds before warm test
     
     # Metrics collection
     'metrics_interval': 1,  # seconds between metric snapshots

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Valkey Streams Worker
-Processes jobs from Valkey Streams with metrics collection
+Valkey Streams Worker - CORRECTED WITH PROPER BATCHING
+Processes jobs from Valkey Streams with batch acknowledgments
 """
 import argparse
 import json
@@ -23,10 +23,11 @@ class MetricsCollector:
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
     
-    def record_job(self, latency_ms):
+    def record_jobs(self, latencies_list):
+        """Record multiple jobs at once (for batch processing)"""
         with self.lock:
-            self.jobs_processed += 1
-            self.latencies.append(latency_ms)
+            self.jobs_processed += len(latencies_list)
+            self.latencies.extend(latencies_list)
     
     def get_metrics(self):
         with self.lock:
@@ -75,6 +76,10 @@ class ValkeyWorker:
         self.consumer_group = VALKEY_CONFIG['consumer_group']
         self.jobs_processed = 0
         
+        # Use Valkey-specific batch size
+        self.batch_size = BENCHMARK['valkey_worker_batch_size']
+        self.poll_interval = BENCHMARK['valkey_worker_poll_interval_ms']
+        
         # Ensure consumer group exists
         try:
             self.valkey.xgroup_create(
@@ -92,29 +97,29 @@ class ValkeyWorker:
         time.sleep(BENCHMARK['job_processing_time_ms'] / 1000.0)
     
     def process_messages(self):
-        """Process messages from Valkey Stream"""
+        """Process messages from Valkey Stream - WITH BATCH ACKNOWLEDGMENT"""
         try:
-            # Read messages from stream
-            # XREADGROUP syntax: XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
+            # Read BATCH of messages from stream
             messages = self.valkey.xreadgroup(
                 groupname=self.consumer_group,
                 consumername=self.worker_id,
                 streams={self.stream_name: '>'},
-                count=BENCHMARK['worker_batch_size'],
-                block=BENCHMARK['worker_poll_interval_ms']
+                count=self.batch_size,  # Fetch multiple messages at once!
+                block=self.poll_interval
             )
             
             if not messages:
                 return 0
             
-            processed = 0
+            # Collect message IDs and latencies for batch acknowledgment
+            message_ids_to_ack = []
+            batch_latencies = []
             
             # Process each message
             for stream_name, stream_messages in messages:
                 for message_id, message_data in stream_messages:
                     try:
                         # Extract message data
-                        payload = message_data.get(b'payload', b'{}')
                         created_at_str = message_data.get(b'created_at', b'').decode('utf-8')
                         
                         if created_at_str:
@@ -125,21 +130,31 @@ class ValkeyWorker:
                         # Simulate processing
                         self.simulate_processing()
                         
-                        # Acknowledge message
-                        self.valkey.xack(self.stream_name, self.consumer_group, message_id)
-                        
-                        # Record metrics
+                        # Calculate latency
                         latency_ms = (datetime.now() - created_at).total_seconds() * 1000
-                        self.metrics.record_job(latency_ms)
+                        batch_latencies.append(latency_ms)
+                        
+                        # Add to acknowledgment batch
+                        message_ids_to_ack.append(message_id)
                         self.jobs_processed += 1
-                        processed += 1
                         
                     except Exception as e:
                         print(f"[{self.worker_id}] Error processing message {message_id}: {e}")
-                        # Don't acknowledge failed messages - they'll be retried
+                        # Don't add failed messages to ack batch
                         continue
             
-            return processed
+            # BATCH ACKNOWLEDGE all successfully processed messages in ONE call
+            if message_ids_to_ack:
+                try:
+                    self.valkey.xack(self.stream_name, self.consumer_group, *message_ids_to_ack)
+                except Exception as e:
+                    print(f"[{self.worker_id}] Error acknowledging batch: {e}")
+            
+            # Record metrics for entire batch
+            if batch_latencies:
+                self.metrics.record_jobs(batch_latencies)
+            
+            return len(message_ids_to_ack)
             
         except Exception as e:
             if 'NOGROUP' in str(e):
@@ -172,8 +187,8 @@ class ValkeyWorker:
             if not pending:
                 return 0
             
-            claimed = 0
-            current_time = int(time.time() * 1000)
+            claimed_ids = []
+            batch_latencies = []
             
             for msg in pending:
                 message_id = msg['message_id']
@@ -191,9 +206,7 @@ class ValkeyWorker:
                         )
                         
                         if result:
-                            claimed += 1
-                            
-                            # Process claimed message
+                            # Process claimed messages
                             for msg_id, msg_data in result:
                                 created_at_str = msg_data.get(b'created_at', b'').decode('utf-8')
                                 if created_at_str:
@@ -202,17 +215,28 @@ class ValkeyWorker:
                                     created_at = datetime.now()
                                 
                                 self.simulate_processing()
-                                self.valkey.xack(self.stream_name, self.consumer_group, msg_id)
                                 
                                 latency_ms = (datetime.now() - created_at).total_seconds() * 1000
-                                self.metrics.record_job(latency_ms)
+                                batch_latencies.append(latency_ms)
+                                claimed_ids.append(msg_id)
                                 self.jobs_processed += 1
                                 
                     except Exception as e:
                         print(f"[{self.worker_id}] Error claiming message {message_id}: {e}")
                         continue
             
-            return claimed
+            # Batch acknowledge claimed messages
+            if claimed_ids:
+                try:
+                    self.valkey.xack(self.stream_name, self.consumer_group, *claimed_ids)
+                except Exception as e:
+                    print(f"[{self.worker_id}] Error acknowledging claimed batch: {e}")
+            
+            # Record metrics
+            if batch_latencies:
+                self.metrics.record_jobs(batch_latencies)
+            
+            return len(claimed_ids)
             
         except Exception as e:
             print(f"[{self.worker_id}] Error claiming pending messages: {e}")
@@ -220,13 +244,13 @@ class ValkeyWorker:
     
     def run(self):
         """Main worker loop"""
-        print(f"[{self.worker_id}] Started")
+        print(f"[{self.worker_id}] Started (batch_size={self.batch_size})")
         
         claim_counter = 0
         
         try:
             while self.running.is_set():
-                # Process new messages
+                # Process new messages in batches
                 processed = self.process_messages()
                 
                 # Periodically claim pending messages (every 10 iterations)
@@ -246,17 +270,25 @@ class ValkeyWorker:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Valkey Streams worker')
+    parser = argparse.ArgumentParser(description='Valkey Streams worker (with proper batching)')
     parser.add_argument('--workers', type=int, default=BENCHMARK['num_workers'],
                        help='Number of worker threads')
     parser.add_argument('--output', default='metrics_valkey.jsonl',
                        help='Metrics output file')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Override batch size from config')
     
     args = parser.parse_args()
+    
+    # Allow command-line override
+    if args.batch_size:
+        BENCHMARK['valkey_worker_batch_size'] = args.batch_size
     
     print(f"Starting {args.workers} Valkey workers")
     print(f"Stream: {VALKEY_CONFIG['stream_name']}")
     print(f"Consumer group: {VALKEY_CONFIG['consumer_group']}")
+    print(f"Batch size: {BENCHMARK['valkey_worker_batch_size']} messages per fetch")
+    print(f"Poll interval: {BENCHMARK['valkey_worker_poll_interval_ms']} ms")
     print(f"Metrics output: {args.output}")
     print("-" * 50)
     

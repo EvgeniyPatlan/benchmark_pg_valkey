@@ -160,6 +160,10 @@ echo ">>> Installing Python dependencies..."
 pip3 install -r setup/requirements.txt --break-system-packages -q 2>/dev/null || \
 pip3 install -r setup/requirements.txt -q
 
+# Also install for root (needed by durability test which runs with sudo)
+sudo pip3 install -r setup/requirements.txt --break-system-packages -q 2>/dev/null || \
+sudo pip3 install -r setup/requirements.txt -q 2>/dev/null || true
+
 # ------------------------------------------------------------
 # 5. Initialize schemas
 # ------------------------------------------------------------

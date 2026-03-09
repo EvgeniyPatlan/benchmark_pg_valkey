@@ -104,7 +104,7 @@ if ! command -v valkey-server &> /dev/null; then
 bind 127.0.0.1
 port 6379
 daemonize no
-supervised systemd
+supervised no
 loglevel notice
 logfile /var/log/valkey/valkey.log
 save ""
@@ -126,7 +126,7 @@ Description=Valkey In-Memory Data Store
 After=network.target
 
 [Service]
-Type=notify
+Type=simple
 User=valkey
 Group=valkey
 ExecStart=/usr/local/bin/valkey-server /etc/valkey/valkey.conf

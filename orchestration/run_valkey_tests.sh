@@ -308,7 +308,7 @@ pgbench -h localhost -i -s 10 > /dev/null 2>&1 || true
 
 # Initialize partitioned streams
 echo "Initializing partitioned Valkey streams..."
-bash ../schema/init_valkey.sh 8
+bash ./schema/init_valkey.sh 8
 
 # Validate baseline Valkey latency
 echo ""

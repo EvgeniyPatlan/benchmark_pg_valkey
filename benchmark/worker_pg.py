@@ -104,7 +104,7 @@ class PostgreSQLWorker:
             job = cursor.fetchone()
             
             if not job:
-                time.sleep(BENCHMARK['worker_poll_interval_ms'] / 1000.0)
+                time.sleep(BENCHMARK['pg_worker_poll_interval_ms'] / 1000.0)
                 return False
             
             job_id = job['job_id']
@@ -143,7 +143,7 @@ class PostgreSQLWorker:
             job = cursor.fetchone()
             
             if not job:
-                time.sleep(BENCHMARK['worker_poll_interval_ms'] / 1000.0)
+                time.sleep(BENCHMARK['pg_worker_poll_interval_ms'] / 1000.0)
                 return False
             
             job_id = job['job_id']
@@ -211,7 +211,7 @@ class PostgreSQLWorker:
                 continue
         
         # No jobs found in any partition
-        time.sleep(BENCHMARK['worker_poll_interval_ms'] / 1000.0)
+        time.sleep(BENCHMARK['pg_worker_poll_interval_ms'] / 1000.0)
         return False
     
     def run(self):

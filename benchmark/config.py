@@ -16,9 +16,18 @@ DB_CONFIG = {
 VALKEY_CONFIG = {
     'host': os.getenv('VALKEY_HOST', 'localhost'),
     'port': int(os.getenv('VALKEY_PORT', '6379')),
-    'stream_name': 'bench_queue',
+    'stream_name': 'bench_queue',          # prefix for partitioned keys
     'consumer_group': 'bench_workers',
+    'num_stream_partitions': 8,            # keys: bench_queue:0 .. bench_queue:7
 }
+
+def get_stream_keys():
+    """Return list of partitioned stream keys"""
+    n = VALKEY_CONFIG['num_stream_partitions']
+    prefix = VALKEY_CONFIG['stream_name']
+    if n <= 1:
+        return [prefix]
+    return [f"{prefix}:{i}" for i in range(n)]
 
 # Benchmark parameters
 BENCHMARK = {
@@ -42,14 +51,13 @@ BENCHMARK = {
     'valkey_worker_batch_size': 50,  # Fetch 50 messages per XREADGROUP call
     'valkey_worker_poll_interval_ms': 100,  # Longer block time for batching
     
-    # For backwards compatibility, keep old field but mark as deprecated
-    'worker_batch_size': 1,  # DEPRECATED: use pg_worker_batch_size or valkey_worker_batch_size
-    'worker_poll_interval_ms': 10,  # DEPRECATED
-    
     # Test scenarios
     'scenarios': ['cold', 'warm', 'load'],
     'warmup_duration': 60,  # seconds before warm test
-    
+
+    # Multi-run for statistical rigor
+    'num_runs': 5,  # run each scenario this many times
+
     # Metrics collection
     'metrics_interval': 1,  # seconds between metric snapshots
     'latency_percentiles': [50, 95, 99, 99.9],
@@ -107,6 +115,21 @@ LOAD_TEST = {
         'test': 'cpu',
     }
 }
+
+# Test environment documentation (fill in when running)
+ENVIRONMENT = {
+    'scope': '1 Valkey standalone node vs 1 PostgreSQL node',
+    'os': os.popen('lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | head -1').read().strip(),
+    'kernel': os.popen('uname -r').read().strip(),
+    'cpu': os.popen("nproc").read().strip() + ' vCPU',
+    'ram': os.popen("free -h | awk '/Mem:/{print $2}'").read().strip(),
+    'pg_version': '16',
+    'valkey_version': '8.0.1',
+    'python_version': os.popen('python3 --version').read().strip(),
+    'psycopg2_version': '2.9.9',
+    'valkey_driver': 'valkey-py',
+}
+
 
 def get_connection_string():
     """Get PostgreSQL connection string"""

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Job Producer
-Generates jobs at a specified rate for benchmarking
+Generates jobs at a specified rate for benchmarking.
+Supports partitioned Valkey stream keys to avoid hot-shard antipattern.
 """
 import argparse
 import json
@@ -19,7 +20,7 @@ try:
 except ImportError:
     valkey = None
 
-from config import BENCHMARK, DB_CONFIG, VALKEY_CONFIG, QUEUE_TYPES
+from config import BENCHMARK, DB_CONFIG, VALKEY_CONFIG, QUEUE_TYPES, get_stream_keys
 
 
 class Producer:
@@ -29,10 +30,10 @@ class Producer:
         self.rate = rate
         self.duration = duration
         self.total_jobs = rate * duration
-        
+
         self.jobs_produced = 0
         self.start_time = None
-        
+
         if backend == 'pg':
             self.conn = psycopg2.connect(**DB_CONFIG)
             self.conn.autocommit = False
@@ -42,27 +43,30 @@ class Producer:
                 print("ERROR: valkey module not installed!")
                 print("Install with: pip3 install valkey")
                 sys.exit(1)
-            
+
             self.valkey = valkey.Valkey(
                 host=VALKEY_CONFIG['host'],
                 port=VALKEY_CONFIG['port'],
                 decode_responses=False
             )
-            self.stream_name = VALKEY_CONFIG['stream_name']
-            
-            # Create consumer group if it doesn't exist
-            try:
-                self.valkey.xgroup_create(
-                    name=self.stream_name,
-                    groupname=VALKEY_CONFIG['consumer_group'],
-                    id='0',
-                    mkstream=True
-                )
-                print(f"Created consumer group: {VALKEY_CONFIG['consumer_group']}")
-            except Exception as e:
-                if 'BUSYGROUP' not in str(e):
-                    print(f"Warning creating consumer group: {e}")
-    
+            self.stream_keys = get_stream_keys()
+            self.num_partitions = len(self.stream_keys)
+            self.consumer_group = VALKEY_CONFIG['consumer_group']
+
+            # Create consumer group on each partition
+            for stream_key in self.stream_keys:
+                try:
+                    self.valkey.xgroup_create(
+                        name=stream_key,
+                        groupname=self.consumer_group,
+                        id='0',
+                        mkstream=True
+                    )
+                    print(f"Created consumer group on: {stream_key}")
+                except Exception as e:
+                    if 'BUSYGROUP' not in str(e):
+                        print(f"Warning creating consumer group on {stream_key}: {e}")
+
     def generate_payload(self):
         """Generate random payload of specified size"""
         size = BENCHMARK['job_size_bytes']
@@ -72,22 +76,22 @@ class Producer:
             'data': ''.join(random.choices(string.ascii_letters + string.digits, k=size - 100))
         }
         return json.dumps(data)
-    
+
     def produce_pg_batch(self, batch_size):
         """Produce a batch of jobs to PostgreSQL"""
         cursor = self.conn.cursor()
-        
+
         jobs = []
         for _ in range(batch_size):
             payload = self.generate_payload()
             priority = random.randint(0, 10)
-            
+
             if self.queue_type == 'partitioned':
                 partition_key = random.randint(0, 15)
                 jobs.append((partition_key, payload, priority))
             else:
                 jobs.append((payload, priority))
-        
+
         try:
             if self.queue_type == 'partitioned':
                 execute_values(
@@ -101,7 +105,7 @@ class Producer:
                     f"INSERT INTO {self.table} (payload, priority) VALUES %s",
                     jobs
                 )
-            
+
             self.conn.commit()
             self.jobs_produced += batch_size
             return batch_size
@@ -109,46 +113,52 @@ class Producer:
             self.conn.rollback()
             print(f"Error producing batch: {e}")
             return 0
-    
+
     def produce_valkey_batch(self, batch_size):
-        """Produce a batch of jobs to Valkey Streams"""
+        """Produce a batch of jobs to Valkey Streams (distributed across partitions)"""
         try:
             pipeline = self.valkey.pipeline()
-            
+
             for _ in range(batch_size):
                 payload = self.generate_payload()
                 priority = random.randint(0, 10)
-                
+
+                # Round-robin across stream partitions
+                partition_idx = self.jobs_produced % self.num_partitions
+                stream_key = self.stream_keys[partition_idx]
+
                 pipeline.xadd(
-                    self.stream_name,
+                    stream_key,
                     {
                         b'payload': payload.encode('utf-8'),
                         b'priority': str(priority).encode('utf-8'),
                         b'created_at': datetime.now().isoformat().encode('utf-8')
                     }
                 )
-            
+                self.jobs_produced += 1
+
             pipeline.execute()
-            self.jobs_produced += batch_size
             return batch_size
         except Exception as e:
             print(f"Error producing batch: {e}")
             return 0
-    
+
     def run(self):
         """Run the producer"""
         print(f"Starting producer: {self.backend}/{self.queue_type}")
         print(f"Rate: {self.rate} jobs/sec")
         print(f"Duration: {self.duration} seconds")
         print(f"Total jobs: {self.total_jobs}")
+        if self.backend == 'valkey':
+            print(f"Stream partitions: {self.num_partitions} ({', '.join(self.stream_keys)})")
         print("-" * 50)
-        
+
         self.start_time = time.time()
         batch_size = max(1, self.rate // 100)  # 100 batches per second
         interval = batch_size / self.rate  # seconds between batches
-        
+
         next_batch_time = self.start_time
-        
+
         try:
             while self.jobs_produced < self.total_jobs:
                 # Produce batch
@@ -156,32 +166,32 @@ class Producer:
                     produced = self.produce_pg_batch(batch_size)
                 else:
                     produced = self.produce_valkey_batch(batch_size)
-                
+
                 # Rate limiting
                 next_batch_time += interval
                 sleep_time = next_batch_time - time.time()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                
+
                 # Progress update
                 elapsed = time.time() - self.start_time
                 if self.jobs_produced % (self.rate * 10) == 0:  # Every 10 seconds
                     actual_rate = self.jobs_produced / elapsed if elapsed > 0 else 0
                     print(f"Produced: {self.jobs_produced}/{self.total_jobs} "
                           f"({actual_rate:.0f} jobs/sec)")
-        
+
         except KeyboardInterrupt:
             print("\nProducer interrupted")
         finally:
             elapsed = time.time() - self.start_time
             actual_rate = self.jobs_produced / elapsed if elapsed > 0 else 0
-            
+
             print("-" * 50)
             print(f"Producer finished")
             print(f"Total jobs produced: {self.jobs_produced}")
             print(f"Elapsed time: {elapsed:.1f} seconds")
             print(f"Actual rate: {actual_rate:.0f} jobs/sec")
-            
+
             if self.backend == 'pg':
                 self.conn.close()
             else:
@@ -199,16 +209,16 @@ def main():
                        help='Production rate (jobs/sec)')
     parser.add_argument('--duration', type=int, default=BENCHMARK['production_duration'],
                        help='Production duration (seconds)')
-    
+
     args = parser.parse_args()
-    
+
     producer = Producer(
         backend=args.backend,
         queue_type=args.queue_type,
         rate=args.rate,
         duration=args.duration
     )
-    
+
     producer.run()
 
 

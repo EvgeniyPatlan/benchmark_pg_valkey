@@ -3,8 +3,11 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [Research Motivation](#research-motivation)
+- [Research Framing](#research-framing)
+- [Decision Guide](#decision-guide)
+- [Test Environment](#test-environment)
 - [System Architecture](#system-architecture)
+- [The Batching Discovery](#the-batching-discovery)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Running Benchmarks](#running-benchmarks)
@@ -19,25 +22,34 @@
 
 This benchmark framework provides a comprehensive, reproducible methodology for comparing **database-backed queue tables** with **in-memory Valkey Streams** under realistic load conditions.
 
+This is not a fight. It is a benchmark to help you understand when each tool fits. PostgreSQL wins on durability, simplicity, and median latency. Valkey wins on throughput stability, tail latency, and CPU efficiency under load.
+
 ### What Gets Tested
 
 - **4 Queue Implementations**: 3 PostgreSQL variants + 1 Valkey Streams
 - **3 Test Scenarios**: Cold start, warm system, mixed load
+- **5 Runs Per Scenario**: For statistical rigor (mean +/- stddev)
 - **Key Metrics**: Throughput, tail latency (p50/p95/p99), CPU usage, memory
 
 ### Test Duration
 
-- **VM1 (PostgreSQL)**: ~2-2.5 hours (9 tests)
-- **VM2 (Valkey)**: ~45 minutes (3 tests)
+- **VM1 (PostgreSQL)**: ~10-12 hours (9 tests x 5 runs each)
+- **VM2 (Valkey)**: ~3-4 hours (3 tests x 5 runs each)
 - **Analysis**: ~5 minutes
 
 ---
 
-## Research Motivation
+## Research Framing
 
-Modern backend systems face a critical architectural decision: use database tables as job queues (simple but potentially slow) or adopt in-memory message streams (complex but potentially faster).
+### Benchmark Fairness Principle
 
-**Research Questions:**
+- **Fairness means realistic deployments**, not hardware parity.
+- The comparison is: **1 PostgreSQL node** (how most teams deploy a PG-backed queue) vs **1 Valkey standalone node** (properly configured, no clustering).
+- A Valkey cluster (3+ nodes) vs 1 PG node would be unfair.
+- A misconfigured single-node Valkey (hot-shard) would also be unfair.
+- Each system is tested at its **best single-node configuration**, matching what a real team would deploy.
+
+### Research Questions
 
 1. Does Valkey Streams reduce database contention compared to DB queues?
 2. How does tail latency change under load?
@@ -47,42 +59,120 @@ Modern backend systems face a critical architectural decision: use database tabl
 
 ---
 
+## Decision Guide
+
+Use this quick-reference to decide which queue technology fits your use case:
+
+| Criterion | PostgreSQL Queue | Valkey Streams |
+|---|---|---|
+| **Throughput** | < 500 jobs/sec | > 500 jobs/sec |
+| **Traffic pattern** | Stable / predictable | Bursty / variable |
+| **p95/p99 SLA** | Not required | Required |
+| **Job durability** | Critical (financial) | Best-effort acceptable |
+| **Operational overhead** | Prefer fewer systems | Dedicated infra OK |
+| **Query flexibility** | Needed (filter/report) | Not needed |
+
+**Use PostgreSQL** for payment processing, user operations, small teams preferring simplicity, and moderate throughput (<500 j/s).
+
+**Use Valkey** for analytics pipelines, event processing, high-volume background jobs, and systems with strict latency SLAs.
+
+**Hybrid approach**: Use PostgreSQL's durability for critical operations, Valkey's performance for high volume.
+
+---
+
+## Test Environment
+
+Every benchmark run automatically saves a full environment specification to `results/*/environment.txt`. You must document:
+
+| Parameter | VM1 (PostgreSQL) | VM2 (Valkey) |
+|---|---|---|
+| **Scope** | 1 PostgreSQL node | 1 Valkey standalone node |
+| **OS** | Ubuntu 22.04/24.04 | Ubuntu 22.04/24.04 |
+| **vCPU** | 8 (recommended) | 8 (recommended) |
+| **RAM** | 16GB (recommended) | 16GB (recommended) |
+| **Disk** | 100GB SSD | 100GB SSD |
+| **PostgreSQL** | 16.x | 16.x (for pgbench) |
+| **Valkey** | - | 8.0.1 |
+| **Python** | 3.9+ | 3.9+ |
+| **Driver** | psycopg2 2.9.9 | valkey-py |
+
+### Load Scenario Configuration
+
+The "load" scenario uses **pgbench** to simulate concurrent transactional traffic:
+
+| Parameter | Value |
+|---|---|
+| **Tool** | pgbench (PostgreSQL built-in TPC-B-like benchmark) |
+| **Clients** | 10 concurrent connections |
+| **Threads** | 4 |
+| **Duration** | 320 seconds (covers test + drain) |
+| **Scale factor** | 10 (~1.6M rows in pgbench_accounts) |
+| **Query type** | Standard TPC-B-like OLTP mix (SELECT/UPDATE/INSERT) |
+| **Purpose** | Simulate real application traffic competing for DB resources |
+
+---
+
 ## System Architecture
 
 ### VM1: PostgreSQL Queue Implementations
 
-#### 1. SKIP LOCKED (Classic)
+#### 1. SKIP LOCKED (Classic) — Most Common Production Default
 
 - `SELECT ... FOR UPDATE SKIP LOCKED`
 - Standard row-level locking
 - Single table with status column
+- **Why included**: This is what most teams actually use. Represents the realistic baseline.
 
-#### 2. DELETE RETURNING (Aggressive)
+#### 2. DELETE RETURNING (Aggressive) — Optimized for Throughput
 
 - Atomic `DELETE ... RETURNING`
-- Removes from queue immediately
-- Archive table for completed jobs
+- Removes from queue immediately, archives completed jobs
+- **Why included**: Represents the best-case optimization where jobs are immediately removed, reducing table bloat.
 
-#### 3. Partitioned (Distributed)
+#### 3. Partitioned (Distributed) — Reduces Lock Contention
 
 - Hash-partitioned queue (16 partitions)
-- Reduces lock contention
-- Workers assigned to specific partitions
+- Reduces lock contention by distributing workers across partitions
+- **Why included**: Represents the most advanced PG queue optimization, reducing contention at the cost of complexity.
 
 ### VM2: Valkey Streams
 
-- Consumer groups for work distribution
+- **8 partitioned stream keys** (`bench_queue:0` through `bench_queue:7`) to avoid hot-shard antipattern
+- Consumer groups for work distribution across all partitions
+- Batch reads (50 messages per XREADGROUP) and batch acknowledgments
 - Automatic message claiming for failed workers
-- Pure in-memory (no persistence)
+- Pure in-memory (no persistence by default)
 - Redis-compatible protocol
 
 ### Test Scenarios
 
-| Scenario              | Description                       | Purpose                     |
-| --------------------- | --------------------------------- | --------------------------- |
-| **Cold Start**  | Fresh DB/Valkey, no cache         | Measure initial performance |
+| Scenario | Description | Purpose |
+|---|---|---|
+| **Cold Start** | Fresh DB/Valkey, no cache | Measure initial performance |
 | **Warm System** | After 60s warmup at 1000 jobs/sec | Measure optimal performance |
-| **Mixed Load**  | Concurrent pgbench (10 clients)   | Measure under contention    |
+| **Mixed Load** | Concurrent pgbench (10 clients, 4 threads, TPC-B OLTP) | Measure under contention |
+
+---
+
+## The Batching Discovery
+
+**The single most important configuration decision for Valkey queue performance.**
+
+Batch size dramatically affects Valkey Streams performance:
+
+| Metric | batch_size=1 | batch_size=50 | Improvement |
+|---|---|---|---|
+| Throughput | ~6% better than PG | ~7-9% better than PG | +6% |
+| p95 Latency | Similar to PG | 223x better than PG | 223x |
+| CPU Usage | Similar to PG | 70-75% less than PG | -25% |
+
+With `batch_size=1`, Valkey performance was mediocre — each XREADGROUP/XACK round-trip has overhead that dominates at single-message granularity. With `batch_size=50`, the amortized overhead per message drops dramatically.
+
+**Configuration** (in `benchmark/config.py`):
+```python
+'valkey_worker_batch_size': 50,  # Messages per XREADGROUP call
+'valkey_worker_poll_interval_ms': 100,  # Block time for batching
+```
 
 ---
 
@@ -111,60 +201,43 @@ Both VMs should have the same CPU, RAM, and disk configuration for fair comparis
 ### Step 1: Extract Archive
 
 ```bash
-# Extract the benchmark framework
 tar -xzf queue-benchmark.tar.gz
 cd queue-benchmark
-
-# Make scripts executable
 chmod +x setup/*.sh orchestration/*.sh schema/*.sh benchmark/*.py analysis/*.py
 ```
 
 ### Step 2: Install on VM1 (PostgreSQL)
 
 ```bash
-# Install system dependencies
 sudo apt-get update
 sudo apt-get install -y git python3 python3-pip sysstat htop iotop
 
-# Install PostgreSQL 16
 sudo ./setup/install_pg.sh
-
-# Install Python dependencies
 pip3 install -r setup/requirements.txt
 
-# Set up authentication
 cat > ~/.pgpass << 'EOF'
 localhost:5432:bench_db:bench_user:bench_pass
 EOF
 chmod 600 ~/.pgpass
 
-# Verify PostgreSQL connection
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "SELECT 1;"
 ```
 
 ### Step 3: Install on VM2 (PostgreSQL + Valkey)
 
 ```bash
-# Install system dependencies
 sudo apt-get update
 sudo apt-get install -y git python3 python3-pip sysstat htop iotop build-essential
 
-# Install PostgreSQL 16
 sudo ./setup/install_pg.sh
-
-# Install Valkey 8
 sudo ./setup/install_valkey.sh
-
-# Install Python dependencies
 pip3 install -r setup/requirements.txt
 
-# Set up authentication
 cat > ~/.pgpass << 'EOF'
 localhost:5432:bench_db:bench_user:bench_pass
 EOF
 chmod 600 ~/.pgpass
 
-# Verify installations
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "SELECT 1;"
 valkey-cli ping  # Should return "PONG"
 ```
@@ -175,15 +248,10 @@ valkey-cli ping  # Should return "PONG"
 
 ```bash
 cd schema/
-
-# Initialize all PostgreSQL queue schemas
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_basic.sql
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_delete_returning.sql
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_partitioned.sql
-
-# Initialize pgbench (for load testing)
 PGPASSWORD=bench_pass pgbench -h localhost -U bench_user -d bench_db -i -s 10
-
 cd ..
 ```
 
@@ -191,16 +259,9 @@ cd ..
 
 ```bash
 cd schema/
-
-# Initialize PostgreSQL schema (for baseline)
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_basic.sql
-
-# Initialize Valkey Streams
-bash init_valkey.sh
-
-# Initialize pgbench
+bash init_valkey.sh 8  # Creates 8 partitioned stream keys
 PGPASSWORD=bench_pass pgbench -h localhost -U bench_user -d bench_db -i -s 10
-
 cd ..
 ```
 
@@ -208,78 +269,56 @@ cd ..
 
 ## Running Benchmarks
 
+### Validate Valkey Baseline Latency (Recommended First Step)
+
+Before running the full benchmark, validate that Valkey latency is reasonable:
+
+```bash
+cd benchmark/
+python3 validate_valkey_latency.py
+```
+
+Expected results for a properly configured single-node Valkey:
+- **p50**: < 5ms (if > 20ms, investigate hot-shard, network RTT, or persistence)
+- **p95**: < 10ms
+- **p99**: < 20ms
+
 ### VM1: PostgreSQL Benchmarks
 
 ```bash
-# Set environment variable for authentication
 export PGPASSWORD=bench_pass
-
-# Run all PostgreSQL tests (~2-2.5 hours)
-./orchestration/run_pg_tests.sh
+./orchestration/run_pg_tests.sh [NUM_RUNS]  # Default: 5 runs per scenario
 ```
 
-This will run:
-
-- **skip_locked**: cold, warm, load (3 tests)
-- **delete_returning**: cold, warm, load (3 tests)
-- **partitioned**: cold, warm, load (3 tests)
-- **Total**: 9 tests × 15 minutes each
-
-**Monitor progress in another terminal:**
-
-```bash
-# Watch queue status
-watch -n 2 'PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "SELECT status, count(*) FROM queue_jobs GROUP BY status;"'
-
-# Monitor system resources
-htop
-
-# Check disk I/O
-iotop
-```
+This runs 9 test configurations x NUM_RUNS = 45 total runs:
+- **skip_locked**: cold, warm, load (x5 each)
+- **delete_returning**: cold, warm, load (x5 each)
+- **partitioned**: cold, warm, load (x5 each)
 
 **Results saved to:** `results/vm1_pg/`
 
 ### VM2: Valkey Benchmarks
 
 ```bash
-# Set environment variable for authentication
 export PGPASSWORD=bench_pass
-
-# Run all Valkey tests (~45 minutes)
-./orchestration/run_valkey_tests.sh
+./orchestration/run_valkey_tests.sh [NUM_RUNS]  # Default: 5 runs per scenario
 ```
 
-This will run:
-
-- **valkey_streams**: cold, warm, load (3 tests)
-
-**Monitor progress in another terminal:**
-
-```bash
-# Watch Valkey stream
-watch -n 2 'valkey-cli XLEN bench_queue'
-
-# Monitor Valkey info
-watch -n 2 'valkey-cli INFO stats | grep instantaneous_ops_per_sec'
-
-# Monitor system resources
-htop
-```
+This runs 3 scenarios x NUM_RUNS = 15 total runs.
 
 **Results saved to:** `results/vm2_valkey/`
 
 ### What Each Test Does
 
-1. **Cleans database/Valkey** (removes old data)
-2. **Starts system metrics collection** (CPU, memory, disk I/O)
-3. **Starts database/Valkey stats collection**
-4. **For "warm" scenario**: Runs 60-second warmup
-5. **For "load" scenario**: Starts pgbench in background
-6. **Starts 20 worker threads**
-7. **Produces 5000 jobs/sec for 5 minutes** (1.5 million jobs total)
-8. **Waits for workers to finish**
-9. **Collects and saves metrics**
+1. Cleans database/Valkey (removes old data)
+2. Starts system metrics collection (CPU, memory, disk I/O)
+3. Starts database/Valkey stats collection
+4. For "warm" scenario: Runs 60-second warmup
+5. For "load" scenario: Starts pgbench (10 clients, 4 threads, TPC-B OLTP) + measures app query latency
+6. Starts 20 worker threads
+7. Produces 1000 jobs/sec for 180 seconds (180,000 jobs total)
+8. Waits for workers to drain the queue
+9. Collects and saves metrics
 
 ---
 
@@ -287,41 +326,16 @@ htop
 
 ### Step 1: Collect Results from Both VMs
 
-**Option A: Analyze on your local machine**
-
 ```bash
-# On your local machine
 mkdir -p queue-benchmark-analysis/results/{vm1_pg,vm2_valkey}
 cd queue-benchmark-analysis
 
-# Copy results from VM1
 scp -r user@vm1:~/queue-benchmark/results/vm1_pg/* results/vm1_pg/
-
-# Copy results from VM2
 scp -r user@vm2:~/queue-benchmark/results/vm2_valkey/* results/vm2_valkey/
-
-# Copy analysis scripts
 scp -r user@vm1:~/queue-benchmark/analysis .
 ```
 
-**Option B: Analyze directly on VM1**
-
-```bash
-# On VM1, copy VM2 results
-scp -r user@vm2:~/queue-benchmark/results/vm2_valkey results/
-
-# Or if you have shared storage
-cp -r /shared/vm2_valkey results/
-```
-
-### Step 2: Install Analysis Dependencies
-
-```bash
-# Install Python packages for visualization
-pip3 install pandas matplotlib seaborn numpy
-```
-
-### Step 3: Run Statistical Analysis
+### Step 2: Run Statistical Analysis
 
 ```bash
 cd analysis/
@@ -332,88 +346,39 @@ python3 analyze.py \
     --output ../results/analysis
 ```
 
-**This will:**
+This will:
+- Parse all metrics files across all runs
+- Calculate mean +/- stddev and 95% confidence intervals
+- Print comparison tables with statistical measures
+- Create `results/analysis/summary.csv`, `summary.json`, and `all_runs.csv`
 
-- Parse all metrics files (JSONL and CSV)
-- Calculate statistics (throughput, latency percentiles, CPU)
-- Print comparison tables to console
-- Create `results/analysis/summary.csv` and `summary.json`
-
-**Console output example:**
-
-```
-================================================================================
-BENCHMARK RESULTS SUMMARY
-================================================================================
-
-SCENARIO: COLD
-────────────────────────────────────────────────────────────────────────────────
-Backend         Queue Type           Throughput      p50 (ms)   p95 (ms)   p99 (ms)   CPU %
-────────────────────────────────────────────────────────────────────────────────
-postgresql      skip_locked          4523 j/s        12.50      45.20      89.30      45.2
-postgresql      delete_returning     4789 j/s        11.20      42.10      85.60      48.1
-postgresql      partitioned          4956 j/s        10.80      38.50      78.20      43.5
-valkey          streams              6234 j/s        5.30       8.90       15.40      28.3
-```
-
-### Step 4: Generate Graphs
+### Step 3: Generate Graphs
 
 ```bash
 python3 generate_graphs.py \
     --input ../results/analysis/summary.csv \
+    --all-runs ../results/analysis/all_runs.csv \
     --output ../results/graphs
 ```
 
-**This creates 6 PNG files:**
+**This creates 7 PNG files (300 DPI):**
 
-1. **throughput_comparison.png**
+1. **throughput_comparison.png** — Bar charts with error bars across scenarios
+2. **latency_comparison.png** — 3x3 grid of latency percentiles with error bars
+3. **latency_distribution.png** — Annotated box plots (Valkey = tight, PG = wide)
+4. **cpu_usage.png** — CPU utilization comparison with error bars
+5. **scenario_comparison.png** — Line graphs showing degradation under stress + stability metric
+6. **valkey_vs_best_pg.png** — Direct comparison with percentage differences
+7. **decision_guide.png** — Visual decision reference table
 
-   - Bar charts comparing throughput across all implementations
-   - Grouped by scenario (cold, warm, load)
-2. **latency_comparison.png**
-
-   - Horizontal bar charts for p50, p95, p99 latencies
-   - 3×3 grid (3 scenarios × 3 percentiles)
-3. **latency_distribution.png**
-
-   - Box plots showing latency distribution
-   - Compares all implementations side-by-side
-4. **cpu_usage.png**
-
-   - CPU utilization comparison
-   - Shows resource efficiency
-5. **scenario_comparison.png**
-
-   - Line graphs showing how each implementation performs across scenarios
-   - Useful for understanding warmup effects and load impact
-6. **valkey_vs_best_pg.png**
-
-   - Direct comparison: Valkey vs best PostgreSQL implementation
-   - Shows the maximum performance gap
-
-**All graphs are publication-quality (300 DPI)**
-
-### Step 5: View the Graphs
-
-**On Linux with GUI:**
+### Step 4: Run Durability Test (Optional)
 
 ```bash
-xdg-open ../results/graphs/throughput_comparison.png
+cd benchmark/
+sudo python3 test_durability.py --num-jobs 10000
 ```
 
-**Copy to local machine:**
-
-```bash
-# From your local machine
-scp -r user@vm1:~/queue-benchmark/results/graphs ./
-```
-
-**In Jupyter Notebook:**
-
-```python
-from IPython.display import Image
-Image(filename='results/graphs/throughput_comparison.png')
-```
+Tests crash recovery under different Valkey persistence modes and compares to PostgreSQL.
 
 ---
 
@@ -421,112 +386,47 @@ Image(filename='results/graphs/throughput_comparison.png')
 
 ### PostgreSQL Connection Issues
 
-**Problem:** `FATAL: password authentication failed for user "bench_user"`
-
-**Solution:**
-
 ```bash
-# Reset password
 sudo -u postgres psql -c "ALTER USER bench_user WITH PASSWORD 'bench_pass';"
-
-# Add to pg_hba.conf
 echo "host    bench_db        bench_user      127.0.0.1/32            md5" | sudo tee -a /etc/postgresql/16/main/pg_hba.conf
-
-# Reload PostgreSQL
 sudo systemctl reload postgresql
-
-# Test connection
-PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "SELECT 1;"
 ```
 
 ### Valkey Connection Issues
 
-**Problem:** `valkey-cli` not found or connection refused
-
-**Solution:**
-
 ```bash
-# Check Valkey status
 sudo systemctl status valkey
-
-# View logs
 sudo tail -f /var/log/valkey/valkey.log
-
-# Restart Valkey
 sudo systemctl restart valkey
-
-# Test connection
-valkey-cli ping  # Should return "PONG"
+valkey-cli ping
 ```
+
+### High Valkey Latency (p50 > 20ms)
+
+If Valkey p50 latency is unexpectedly high:
+
+1. **Run the validation script**: `python3 validate_valkey_latency.py`
+2. **Check if using partitioned streams**: Single-key (`bench_queue`) serializes all traffic. Use 8 partitioned keys.
+3. **Check persistence**: `valkey-cli CONFIG GET appendonly` — if `yes`, this adds latency
+4. **Check network**: `valkey-cli --latency` — should be < 1ms for localhost
+5. **Check poll interval**: Higher `valkey_worker_poll_interval_ms` increases apparent latency
 
 ### Worker/Producer Hangs
 
-**Problem:** Workers or producer seem stuck
-
-**Solution:**
-
 ```bash
-# Check if processes are running
 ps aux | grep python3
-
-# Check for errors in producer log
-tail -f results/vm1_pg/skip_locked_cold_producer.log
-
-# Check database for stuck jobs
-PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c \
-  "SELECT status, count(*), max(created_at) FROM queue_jobs GROUP BY status;"
-
-# Kill stuck processes
+tail -f results/vm1_pg/skip_locked_cold_run1_producer.log
 pkill -f worker_pg.py
 pkill -f producer.py
 ```
 
 ### Disk Space Issues
 
-**Problem:** Out of disk space during benchmark
-
-**Solution:**
-
 ```bash
-# Check disk usage
 df -h
-
-# Clean old results
 rm -rf results/vm1_pg/*
-
-# Truncate PostgreSQL tables
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "TRUNCATE queue_jobs;"
-
-# Vacuum PostgreSQL
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "VACUUM FULL;"
-```
-
-### Analysis Script Errors
-
-**Problem:** `ImportError` or `ModuleNotFoundError`
-
-**Solution:**
-
-```bash
-# Install missing packages
-pip3 install pandas matplotlib seaborn numpy psutil
-
-# Or reinstall all
-pip3 install -r setup/requirements.txt
-```
-
-### Graphs Not Generating
-
-**Problem:** Matplotlib backend issues on headless server
-
-**Solution:**
-
-```bash
-# Set matplotlib to use non-interactive backend
-export MPLBACKEND=Agg
-
-# Then run graph generation
-python3 generate_graphs.py --input ../results/analysis/summary.csv
 ```
 
 ---
@@ -535,21 +435,39 @@ python3 generate_graphs.py --input ../results/analysis/summary.csv
 
 ### Benchmark Parameters
 
-Edit `benchmark/config.py` to adjust test parameters:
+Edit `benchmark/config.py`:
 
 ```python
 BENCHMARK = {
-    'production_rate': 1000,        # Jobs per second (default: 1000)
-    'production_duration': 180,     # Test duration in seconds (default: 180)
-    'num_workers': 20,              # Concurrent workers (default: 20)
-    'job_size_bytes': 512,         # Payload size (default: 1KB)
-    'job_processing_time_ms': 10,   # Simulated work time (default: 10ms)
+    'production_rate': 1000,        # Jobs per second
+    'production_duration': 180,     # Test duration in seconds
+    'num_workers': 10,              # Concurrent workers (orchestration scripts use 20)
+    'job_size_bytes': 512,          # Payload size
+    'job_processing_time_ms': 5,    # Simulated work time
+
+    # PG workers: single-row fetches, fast polling
+    'pg_worker_batch_size': 1,
+    'pg_worker_poll_interval_ms': 10,
+
+    # Valkey workers: batch reads, longer block time
+    'valkey_worker_batch_size': 50,
+    'valkey_worker_poll_interval_ms': 100,
+
+    'num_runs': 5,                  # Runs per scenario for statistical rigor
+}
+```
+
+### Valkey Stream Partitioning
+
+```python
+VALKEY_CONFIG = {
+    'stream_name': 'bench_queue',       # prefix
+    'consumer_group': 'bench_workers',
+    'num_stream_partitions': 8,         # bench_queue:0 .. bench_queue:7
 }
 ```
 
 ### Database Configuration
-
-Edit `benchmark/config.py` to change connection settings:
 
 ```python
 DB_CONFIG = {
@@ -561,89 +479,43 @@ DB_CONFIG = {
 }
 ```
 
-### Valkey Configuration
-
-Edit `benchmark/config.py`:
-
-```python
-VALKEY_CONFIG = {
-    'host': 'localhost',
-    'port': 6379,
-    'stream_name': 'bench_queue',
-    'consumer_group': 'bench_workers',
-}
-```
-
-### PostgreSQL Performance Tuning
-
-The installation script configures PostgreSQL with these settings (in `/etc/postgresql/16/main/conf.d/performance.conf`):
-
-```ini
-shared_buffers = 2GB
-effective_cache_size = 6GB
-maintenance_work_mem = 512MB
-work_mem = 32MB
-max_connections = 200
-```
-
-Adjust based on your VM's RAM.
-
 ---
 
 ## Understanding Results
 
 ### Metrics Explained
 
-| Metric                | Description                | Good Value                    |
-| --------------------- | -------------------------- | ----------------------------- |
-| **Throughput**  | Jobs processed per second  | Higher is better              |
-| **p50 Latency** | Median job completion time | Lower is better, typical case |
-| **p95 Latency** | 95th percentile latency    | Lower is better, SLA target   |
-| **p99 Latency** | 99th percentile latency    | Lower is better, worst case   |
-| **CPU Usage**   | Average CPU utilization    | Lower = more efficient        |
-| **Memory**      | RAM consumption            | Lower = more efficient        |
+| Metric | Description | Good Value |
+|---|---|---|
+| **Throughput** | Jobs processed per second (mean +/- stddev) | Higher is better |
+| **p50 Latency** | Median job completion time | Lower is better |
+| **p95 Latency** | 95th percentile latency (SLA target) | Lower is better |
+| **p99 Latency** | 99th percentile latency (worst case) | Lower is better |
+| **CPU Usage** | Average CPU utilization (mean +/- stddev) | Lower = more efficient |
+| **Stddev** | Standard deviation across runs | Lower = more reproducible |
 
 ### Expected Patterns
 
 **Throughput:**
-
 - Valkey should be 20-40% higher than PostgreSQL
 - Partitioned queue should be fastest PostgreSQL variant
-- Under load, all implementations degrade somewhat
+- Under load, all implementations degrade somewhat — Valkey the least
 
 **Latency:**
-
 - Valkey should have 50-70% lower p95/p99 latency
 - Cold start has higher latency than warm
-- Under load, tail latency (p99) increases significantly
+- Under load, tail latency (p99) increases significantly for PostgreSQL
 
 **CPU Usage:**
-
-- Valkey typically uses 30-50% less CPU
-- Partitioned queue uses slightly more CPU (parallelism overhead)
-- DELETE RETURNING may show higher CPU due to archiving
-
-### Interpreting Graphs
-
-1. **throughput_comparison.png**
-
-   - Look for consistent performance across scenarios
-   - Identify which implementation degrades least under load
-2. **latency_comparison.png**
-
-   - Focus on p95 and p99 (these matter for SLAs)
-   - Large p99 spikes indicate queueing/contention issues
-3. **valkey_vs_best_pg.png**
-
-   - Shows the maximum performance gap
-   - Helps justify architectural decision
+- Valkey typically uses 30-50% less CPU (with proper batching: 70-75% less)
 
 ### Red Flags
 
 - **Throughput drops >50% under load**: Serious contention
 - **p99 latency >10x p50**: Queue depth issues
 - **CPU at 100%**: System is bottlenecked
-- **Metrics missing**: Test failed, check logs
+- **Valkey p50 > 20ms**: Check for hot-shard antipattern
+- **High stddev across runs**: Environmental instability, re-run with machine isolated
 
 ---
 
@@ -652,116 +524,41 @@ Adjust based on your VM's RAM.
 ```
 queue-benchmark/
 ├── README.md                    # This file
-├── QUICKSTART.md               # Quick reference guide
-├── PROJECT_SUMMARY.md          # Research methodology
-├── CHECKLIST.md                # Execution checklist
+├── QUICKSTART.sh                # Quick reference guide
 │
-├── setup/                      # Installation scripts
-│   ├── install_pg.sh          # PostgreSQL 16 setup
-│   ├── install_valkey.sh      # Valkey 8 setup
-│   └── requirements.txt       # Python dependencies
+├── setup/                       # Installation scripts
+│   ├── install_pg.sh            # PostgreSQL 16 setup
+│   ├── install_valkey.sh        # Valkey 8 setup
+│   └── requirements.txt         # Python dependencies
 │
-├── schema/                     # Database schemas
-│   ├── pg_queue_basic.sql                # SKIP LOCKED implementation
-│   ├── pg_queue_delete_returning.sql     # DELETE RETURNING implementation
-│   ├── pg_queue_partitioned.sql          # Partitioned queue (16 partitions)
-│   └── init_valkey.sh                    # Valkey Streams setup
+├── schema/                      # Database schemas
+│   ├── pg_queue_basic.sql       # SKIP LOCKED (most common default)
+│   ├── pg_queue_delete_returning.sql  # DELETE RETURNING (optimized)
+│   ├── pg_queue_partitioned.sql # Partitioned queue (16 partitions)
+│   └── init_valkey.sh           # Partitioned Valkey Streams setup (8 keys)
 │
-├── benchmark/                  # Core benchmark code
-│   ├── config.py              # Configuration (rates, workers, etc.)
-│   ├── producer.py            # Job producer (generates load)
-│   ├── worker_pg.py           # PostgreSQL queue workers
-│   └── worker_valkey.py       # Valkey Streams workers
+├── benchmark/                   # Core benchmark code
+│   ├── config.py                # All configuration + environment detection
+│   ├── producer.py              # Job producer (PG + partitioned Valkey)
+│   ├── worker_pg.py             # PostgreSQL queue workers
+│   ├── worker_valkey.py         # Valkey Streams workers (partitioned + batched)
+│   ├── validate_valkey_latency.py  # Baseline latency validation
+│   ├── test_durability.py       # Crash recovery testing
+│   └── measure_app_queries.py   # App query impact measurement
 │
-├── orchestration/             # Test execution scripts
-│   ├── run_pg_tests.sh        # Run all PostgreSQL tests
-│   └── run_valkey_tests.sh    # Run all Valkey tests
+├── orchestration/               # Test execution scripts
+│   ├── run_pg_tests.sh          # All PG tests (multi-run, env logging)
+│   └── run_valkey_tests.sh      # All Valkey tests (multi-run, env logging)
 │
-├── analysis/                  # Results analysis
-│   ├── analyze.py             # Statistical analysis
-│   └── generate_graphs.py     # Graph generation
+├── analysis/                    # Results analysis
+│   ├── analyze.py               # Statistical analysis (mean +/- stddev, CI)
+│   └── generate_graphs.py       # Graph generation (error bars, annotations)
 │
-└── results/                   # Test results (generated)
-    ├── vm1_pg/                # PostgreSQL results
-    │   ├── skip_locked_cold_metrics.jsonl
-    │   ├── skip_locked_cold_system.csv
-    │   ├── skip_locked_cold_db_stats.csv
-    │   └── ... (27 files total)
-    │
-    ├── vm2_valkey/            # Valkey results
-    │   ├── valkey_cold_metrics.jsonl
-    │   ├── valkey_cold_system.csv
-    │   ├── valkey_cold_valkey_stats.csv
-    │   └── ... (9 files total)
-    │
-    ├── analysis/              # Analyzed results
-    │   ├── summary.csv
-    │   └── summary.json
-    │
-    └── graphs/                # Generated visualizations
-        ├── throughput_comparison.png
-        ├── latency_comparison.png
-        ├── latency_distribution.png
-        ├── cpu_usage.png
-        ├── scenario_comparison.png
-        └── valkey_vs_best_pg.png
-```
-
----
-
-## Quick Reference Commands
-
-### Start Benchmarks
-
-```bash
-# VM1 - PostgreSQL
-export PGPASSWORD=bench_pass
-./orchestration/run_pg_tests.sh
-
-# VM2 - Valkey
-export PGPASSWORD=bench_pass
-./orchestration/run_valkey_tests.sh
-```
-
-### Monitor Progress
-
-```bash
-# PostgreSQL queue status
-watch -n 2 'PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "SELECT status, count(*) FROM queue_jobs GROUP BY status;"'
-
-# Valkey stream length
-watch -n 2 'valkey-cli XLEN bench_queue'
-
-# System resources
-htop
-```
-
-### Analyze Results
-
-```bash
-cd analysis/
-
-# Statistical analysis
-python3 analyze.py \
-    --pg-results ../results/vm1_pg \
-    --valkey-results ../results/vm2_valkey
-
-# Generate graphs
-python3 generate_graphs.py \
-    --input ../results/analysis/summary.csv
-```
-
-### Clean Up
-
-```bash
-# Clean PostgreSQL
-PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -c "TRUNCATE queue_jobs;"
-
-# Clean Valkey
-valkey-cli FLUSHDB
-
-# Remove old results
-rm -rf results/vm1_pg/* results/vm2_valkey/*
+└── results/                     # Test results (generated)
+    ├── vm1_pg/                  # PostgreSQL results + environment.txt
+    ├── vm2_valkey/              # Valkey results + environment.txt
+    ├── analysis/                # summary.csv, summary.json, all_runs.csv
+    └── graphs/                  # 7 PNG visualizations (300 DPI)
 ```
 
 ---
@@ -769,7 +566,3 @@ rm -rf results/vm1_pg/* results/vm2_valkey/*
 ## License
 
 MIT License - Feel free to use, modify, and distribute.
-
----
-
-**Happy Benchmarking!** 🚀

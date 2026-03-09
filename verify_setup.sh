@@ -77,6 +77,21 @@ else
     echo -e "${YELLOW}  valkey module not installed (OK for VM1, required for VM2)${NC}"
 fi
 
+# Check Valkey stream partitions (if Valkey is available)
+if valkey-cli ping > /dev/null 2>&1; then
+    echo ""
+    echo "3b. Checking Valkey stream partitions..."
+    PARTITION_COUNT=0
+    for i in $(seq 0 7); do
+        valkey-cli EXISTS "bench_queue:$i" > /dev/null 2>&1 && PARTITION_COUNT=$((PARTITION_COUNT + 1))
+    done
+    if [ $PARTITION_COUNT -gt 0 ]; then
+        print_status 0 "Valkey stream partitions found ($PARTITION_COUNT/8)"
+    else
+        echo -e "${YELLOW}  No Valkey stream partitions found. Run: bash schema/init_valkey.sh 8${NC}"
+    fi
+fi
+
 if [ $PANDAS_STATUS -ne 0 ] || [ $MATPLOTLIB_STATUS -ne 0 ]; then
     echo ""
     echo -e "${YELLOW}Installing missing Python packages...${NC}"

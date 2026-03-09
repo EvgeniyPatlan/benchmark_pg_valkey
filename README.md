@@ -8,6 +8,7 @@
 - [Test Environment](#test-environment)
 - [System Architecture](#system-architecture)
 - [The Batching Discovery](#the-batching-discovery)
+- [Quick Start (VM Scripts)](#quick-start-vm-scripts)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Running Benchmarks](#running-benchmarks)
@@ -172,6 +173,54 @@ With `batch_size=1`, Valkey performance was mediocre — each XREADGROUP/XACK ro
 ```python
 'valkey_worker_batch_size': 50,  # Messages per XREADGROUP call
 'valkey_worker_poll_interval_ms': 100,  # Block time for batching
+```
+
+---
+
+## Quick Start (VM Scripts)
+
+The fastest way to run the full benchmark is with the self-contained VM scripts. Each script handles all installation, configuration, schema setup, and benchmark execution on a fresh Ubuntu 24.04 VM.
+
+### VM1: PostgreSQL Benchmark
+
+```bash
+chmod +x run_vm1_pg.sh
+./run_vm1_pg.sh          # 5 runs per scenario (default, ~10-12 hours)
+./run_vm1_pg.sh 1        # 1 run per scenario (quick smoke test, ~2-3 hours)
+```
+
+Installs PostgreSQL 16, creates the benchmark database, initializes all three queue schemas (skip_locked, delete_returning, partitioned), and runs the full benchmark suite.
+
+### VM2: Valkey Benchmark
+
+```bash
+chmod +x run_vm2_valkey.sh
+./run_vm2_valkey.sh      # 5 runs per scenario (default, ~3-4 hours)
+./run_vm2_valkey.sh 1    # 1 run per scenario (quick smoke test, ~45 min)
+```
+
+Installs PostgreSQL 16 (for pgbench load generation), compiles Valkey 8 from source, sets up partitioned streams, validates baseline latency, runs the benchmark suite, and runs the durability test.
+
+### After Both VMs Finish
+
+Collect results from both VMs and run analysis:
+
+```bash
+# On either VM (or a third machine):
+mkdir -p results/{vm1_pg,vm2_valkey}
+scp -r user@pg-vm:~/benchmark_pg_valkey/results/vm1_pg/* results/vm1_pg/
+scp -r user@valkey-vm:~/benchmark_pg_valkey/results/vm2_valkey/* results/vm2_valkey/
+
+cd analysis/
+python3 analyze.py \
+    --pg-results ../results/vm1_pg \
+    --valkey-results ../results/vm2_valkey \
+    --output ../results/analysis
+
+python3 generate_graphs.py \
+    --input ../results/analysis/summary.csv \
+    --all-runs ../results/analysis/all_runs.csv \
+    --output ../results/graphs
 ```
 
 ---
@@ -524,7 +573,8 @@ DB_CONFIG = {
 ```
 queue-benchmark/
 ├── README.md                    # This file
-├── QUICKSTART.sh                # Quick reference guide
+├── run_vm1_pg.sh                # Self-contained PG VM setup + benchmark
+├── run_vm2_valkey.sh            # Self-contained Valkey VM setup + benchmark
 │
 ├── setup/                       # Installation scripts
 │   ├── install_pg.sh            # PostgreSQL 16 setup

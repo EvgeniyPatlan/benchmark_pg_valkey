@@ -121,6 +121,27 @@ collect_system_metrics() {
     } > "$output_file"
 }
 
+# Function to get total pending (unacknowledged) messages across all partitions
+get_total_pending() {
+    local total=0
+    local NUM_PARTITIONS=8
+    local STREAM_PREFIX="bench_queue"
+    local GROUP="bench_workers"
+
+    for i in $(seq 0 $((NUM_PARTITIONS - 1))); do
+        local key="${STREAM_PREFIX}:${i}"
+        # XPENDING returns: [num_pending, min_id, max_id, [[consumer, count], ...]]
+        # First field is the pending count
+        local n=$(valkey-cli XPENDING "$key" "$GROUP" 2>/dev/null | head -1)
+        # If no group or error, fall back to XLEN
+        if [ -z "$n" ] || ! [[ "$n" =~ ^[0-9]+$ ]]; then
+            n=$(valkey-cli XLEN "$key" 2>/dev/null || echo 0)
+        fi
+        total=$((total + n))
+    done
+    echo $total
+}
+
 # Function to get total stream length across all partitions
 get_total_stream_length() {
     local total=0
@@ -229,20 +250,21 @@ run_benchmark() {
 
     echo "Producer finished. Waiting for workers to complete remaining jobs..."
 
-    # Wait for streams to be drained
+    # Wait for all messages to be acknowledged (pending count reaches 0)
     MAX_WAIT=300
     ELAPSED=0
     INTERVAL=5
 
     while [ $ELAPSED -lt $MAX_WAIT ]; do
-        REMAINING=$(get_total_stream_length)
+        PENDING=$(get_total_pending)
+        TOTAL=$(get_total_stream_length)
 
-        if [ "$REMAINING" -eq 0 ] 2>/dev/null; then
-            echo "All jobs completed!"
+        if [ "$PENDING" -eq 0 ] 2>/dev/null; then
+            echo "All jobs acknowledged! (total stream length: $TOTAL)"
             break
         fi
 
-        echo "Still processing... ($REMAINING messages remaining across partitions)"
+        echo "Still processing... ($PENDING pending messages, $TOTAL total in streams)"
         sleep $INTERVAL
         ELAPSED=$((ELAPSED + INTERVAL))
     done

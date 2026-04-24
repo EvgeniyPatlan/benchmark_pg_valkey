@@ -14,10 +14,33 @@
 set -e
 
 # Configuration
-RESULTS_DIR="./results/vm2_valkey"
+RESULTS_DIR="${RESULTS_DIR:-./results/vm2_valkey}"
 BENCHMARK_DIR="./benchmark"
 SCENARIOS=("cold" "warm" "load")
 NUM_RUNS=${1:-5}  # Default 5 runs per scenario
+
+# Durability mode: none | matched | strict.
+#   none    -> appendonly no, save "" (legacy default, zero-durability)
+#   matched -> appendfsync everysec (roughly matches PG synchronous_commit=off)
+#   strict  -> appendfsync always (matches PG synchronous_commit=on)
+# Reviewer concern #2: the headline comparison should include at least one
+# matched-durability data point.
+DURABILITY_MODE="${DURABILITY_MODE:-none}"
+export DURABILITY_MODE
+
+NUM_WORKERS="${NUM_WORKERS:-20}"
+export JOB_PROCESSING_TIME_MS="${JOB_PROCESSING_TIME_MS:-5}"
+
+# VM2 pgbench must be identical to VM1 so Valkey-under-load and
+# PG-under-load are symmetric (reviewer smaller note).
+PGBENCH_CLIENTS="${PGBENCH_CLIENTS:-10}"
+PGBENCH_THREADS="${PGBENCH_THREADS:-4}"
+PGBENCH_DURATION="${PGBENCH_DURATION:-320}"
+PGBENCH_SCALE="${PGBENCH_SCALE:-10}"
+
+PRODUCER_AUTO_CAP="${PRODUCER_AUTO_CAP:-0}"
+PRODUCER_RATE="${PRODUCER_RATE:-1000}"
+CAPACITY_FILE="${CAPACITY_FILE:-results/capacity.json}"
 
 # Check PGPASSWORD is set (needed for pgbench in load test)
 if [ -z "$PGPASSWORD" ]; then
@@ -56,26 +79,56 @@ save_environment() {
     echo "Valkey Configuration:" >> "$env_file"
     echo "  Stream partitions: 8 (bench_queue:0 .. bench_queue:7)" >> "$env_file"
     echo "  Consumer group: bench_workers" >> "$env_file"
-    echo "  Persistence: disabled (save '', appendonly no)" >> "$env_file"
-    echo "  maxmemory: 4gb" >> "$env_file"
-    echo "  maxmemory-policy: noeviction" >> "$env_file"
+    echo "  Durability mode: $DURABILITY_MODE" >> "$env_file"
+    echo "  appendonly: $(valkey-cli CONFIG GET appendonly | tail -1)" >> "$env_file"
+    echo "  appendfsync: $(valkey-cli CONFIG GET appendfsync | tail -1)" >> "$env_file"
+    echo "  save: $(valkey-cli CONFIG GET save | tail -1)" >> "$env_file"
+    echo "  maxmemory: $(valkey-cli CONFIG GET maxmemory | tail -1)" >> "$env_file"
+    echo "  maxmemory-policy: $(valkey-cli CONFIG GET maxmemory-policy | tail -1)" >> "$env_file"
     echo "" >> "$env_file"
-    echo "Load Scenario Configuration:" >> "$env_file"
+    echo "Load Scenario Configuration (identical to VM1 for symmetry):" >> "$env_file"
     echo "  Tool: pgbench" >> "$env_file"
-    echo "  Clients: 10" >> "$env_file"
-    echo "  Threads: 4" >> "$env_file"
-    echo "  Duration: 320s" >> "$env_file"
-    echo "  Scale factor: 10" >> "$env_file"
+    echo "  Clients: $PGBENCH_CLIENTS" >> "$env_file"
+    echo "  Threads: $PGBENCH_THREADS" >> "$env_file"
+    echo "  Duration: ${PGBENCH_DURATION}s" >> "$env_file"
+    echo "  Scale factor: $PGBENCH_SCALE" >> "$env_file"
     echo "" >> "$env_file"
     echo "Benchmark Parameters:" >> "$env_file"
-    echo "  Production rate: 1000 jobs/sec" >> "$env_file"
+    echo "  Production rate: ${PRODUCER_RATE} jobs/sec (pre-cap)" >> "$env_file"
+    echo "  Auto-cap: $PRODUCER_AUTO_CAP (fraction=0.9, capacity=$CAPACITY_FILE)" >> "$env_file"
     echo "  Duration: 180 seconds" >> "$env_file"
-    echo "  Workers: 20" >> "$env_file"
+    echo "  Workers: $NUM_WORKERS" >> "$env_file"
     echo "  Worker batch size: 50" >> "$env_file"
     echo "  Job size: 512 bytes" >> "$env_file"
-    echo "  Processing time: 5ms (simulated)" >> "$env_file"
+    echo "  Processing time: ${JOB_PROCESSING_TIME_MS}ms (simulated)" >> "$env_file"
     echo "  Runs per scenario: $NUM_RUNS" >> "$env_file"
     echo "Saved environment info to $env_file"
+}
+
+# Apply Valkey durability mode at runtime via CONFIG SET so we don't need to
+# restart the server between runs.
+apply_durability_mode() {
+    case "$DURABILITY_MODE" in
+        none)
+            echo "Durability mode = none (appendonly off, in-memory only)"
+            valkey-cli CONFIG SET appendonly no > /dev/null
+            valkey-cli CONFIG SET save "" > /dev/null
+            ;;
+        matched)
+            echo "Durability mode = matched (appendonly on, appendfsync everysec)"
+            valkey-cli CONFIG SET appendonly yes > /dev/null
+            valkey-cli CONFIG SET appendfsync everysec > /dev/null
+            ;;
+        strict)
+            echo "Durability mode = strict (appendonly on, appendfsync always)"
+            valkey-cli CONFIG SET appendonly yes > /dev/null
+            valkey-cli CONFIG SET appendfsync always > /dev/null
+            ;;
+        *)
+            echo "ERROR: unknown DURABILITY_MODE=$DURABILITY_MODE"
+            exit 1
+            ;;
+    esac
 }
 
 # Function to clean Valkey (all partitions)
@@ -169,19 +222,25 @@ run_benchmark() {
     # Clean Valkey
     clean_valkey
 
+    local producer_extra=()
+    if [ "$PRODUCER_AUTO_CAP" == "1" ]; then
+        producer_extra=(--auto-cap --capacity-file "$CAPACITY_FILE")
+    fi
+
     # Handle scenario-specific setup
     if [ "$scenario" == "warm" ]; then
         echo "Warming up system..."
 
         python3 "$BENCHMARK_DIR/worker_valkey.py" \
-            --workers 20 \
+            --workers "$NUM_WORKERS" \
             --output "${result_prefix}_warmup_metrics.jsonl" &
         WORKER_PID=$!
 
         python3 "$BENCHMARK_DIR/producer.py" \
             --backend valkey \
-            --rate 1000 \
-            --duration 60
+            --rate "$PRODUCER_RATE" \
+            --duration 60 \
+            "${producer_extra[@]}"
 
         echo "Waiting for workers to process warmup jobs..."
         sleep 30
@@ -213,11 +272,11 @@ run_benchmark() {
 
     # Start background load if needed
     if [ "$scenario" == "load" ]; then
-        echo "Starting background load..."
+        echo "Starting background load (identical to VM1 for symmetry)..."
         echo "  Tool: pgbench (TPC-B-like OLTP)"
-        echo "  Clients: 10, Threads: 4, Duration: 320s"
+        echo "  Clients: $PGBENCH_CLIENTS, Threads: $PGBENCH_THREADS, Duration: ${PGBENCH_DURATION}s, Scale: $PGBENCH_SCALE"
         pgbench -h localhost \
-            -c 10 -j 4 -T 320 \
+            -c "$PGBENCH_CLIENTS" -j "$PGBENCH_THREADS" -T "$PGBENCH_DURATION" \
             > "${result_prefix}_pgbench.log" 2>&1 &
         PGBENCH_PID=$!
 
@@ -232,20 +291,21 @@ run_benchmark() {
     fi
 
     # Start workers
-    echo "Starting workers..."
+    echo "Starting workers ($NUM_WORKERS)..."
     python3 "$BENCHMARK_DIR/worker_valkey.py" \
-        --workers 20 \
+        --workers "$NUM_WORKERS" \
         --output "${result_prefix}_metrics.jsonl" &
     WORKER_PID=$!
 
     sleep 2
 
     # Start producer
-    echo "Starting producer (1000 jobs/sec for 180 seconds)..."
+    echo "Starting producer (${PRODUCER_RATE} jobs/sec for 180 seconds, auto-cap=$PRODUCER_AUTO_CAP)..."
     python3 "$BENCHMARK_DIR/producer.py" \
         --backend valkey \
-        --rate 1000 \
+        --rate "$PRODUCER_RATE" \
         --duration 180 \
+        "${producer_extra[@]}" \
         > "${result_prefix}_producer.log" 2>&1
 
     echo "Producer finished. Waiting for workers to complete remaining jobs..."
@@ -321,12 +381,15 @@ valkey-cli ping > /dev/null 2>&1 || {
     exit 1
 }
 
+# Apply durability mode first so environment.txt captures the active values.
+apply_durability_mode
+
 # Save environment
 save_environment
 
 # Initialize pgbench
-echo "Initializing pgbench..."
-pgbench -h localhost -i -s 10 > /dev/null 2>&1 || true
+echo "Initializing pgbench (scale=$PGBENCH_SCALE)..."
+pgbench -h localhost -i -s "$PGBENCH_SCALE" > /dev/null 2>&1 || true
 
 # Initialize partitioned streams
 echo "Initializing partitioned Valkey streams..."

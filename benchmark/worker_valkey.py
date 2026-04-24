@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Valkey Streams Worker - WITH PARTITIONED STREAMS AND PROPER BATCHING
-Reads from multiple stream keys to avoid hot-shard antipattern.
-Uses batch XREADGROUP across partitions + batch XACK.
+Valkey Streams Worker - partitioned streams, proper batching
+
+Records both SERVICE latency (dequeue -> ack) and END-TO-END latency
+(enqueue -> ack) so that queue buildup from an overdriven producer can't
+be conflated with Valkey's actual processing time (reviewer concern #1).
 """
 import argparse
 import json
@@ -20,54 +22,76 @@ class MetricsCollector:
     def __init__(self, output_file):
         self.output_file = output_file
         self.jobs_processed = 0
-        self.latencies = []
+        self.latencies_e2e = []
+        self.latencies_service = []
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
-        self._window_start = time.time()
-        self._window_latencies = []
+        self._window_e2e = []
+        self._window_service = []
 
-    def record_jobs(self, latencies_list):
-        """Record multiple jobs at once (for batch processing)"""
+    def record_jobs(self, pairs):
+        """pairs: list of (e2e_ms, service_ms) tuples."""
         with self.lock:
-            self.jobs_processed += len(latencies_list)
-            self.latencies.extend(latencies_list)
-            self._window_latencies.extend(latencies_list)
+            self.jobs_processed += len(pairs)
+            for e2e, svc in pairs:
+                self.latencies_e2e.append(e2e)
+                self.latencies_service.append(svc)
+                self._window_e2e.append(e2e)
+                self._window_service.append(svc)
+
+    @staticmethod
+    def _p(sorted_vals, pct):
+        if not sorted_vals:
+            return 0.0
+        idx = min(len(sorted_vals) - 1, int(len(sorted_vals) * pct))
+        return sorted_vals[idx]
 
     def get_metrics(self):
         with self.lock:
-            if not self.latencies:
+            if not self.latencies_e2e:
                 return None
 
-            sorted_latencies = sorted(self.latencies)
-            n = len(sorted_latencies)
-
-            # Window stats (since last snapshot) for more accurate recent metrics
-            window_sorted = sorted(self._window_latencies) if self._window_latencies else sorted_latencies
-            wn = len(window_sorted)
+            e2e_sorted = sorted(self.latencies_e2e)
+            svc_sorted = sorted(self.latencies_service)
+            wsvc_sorted = sorted(self._window_service) if self._window_service else svc_sorted
+            we2e_sorted = sorted(self._window_e2e) if self._window_e2e else e2e_sorted
+            elapsed = time.time() - self.start_time
 
             metrics = {
                 'timestamp': datetime.now().isoformat(),
-                'elapsed': time.time() - self.start_time,
+                'elapsed': elapsed,
                 'jobs_processed': self.jobs_processed,
-                'throughput': self.jobs_processed / (time.time() - self.start_time),
-                # Cumulative percentiles
-                'latency_p50': sorted_latencies[int(n * 0.50)] if n > 0 else 0,
-                'latency_p95': sorted_latencies[int(n * 0.95)] if n > 0 else 0,
-                'latency_p99': sorted_latencies[int(n * 0.99)] if n > 0 else 0,
-                'latency_min': sorted_latencies[0] if n > 0 else 0,
-                'latency_max': sorted_latencies[-1] if n > 0 else 0,
-                'latency_avg': sum(sorted_latencies) / n if n > 0 else 0,
-                # Window percentiles (recent)
-                'window_p50': window_sorted[int(wn * 0.50)] if wn > 0 else 0,
-                'window_p95': window_sorted[int(wn * 0.95)] if wn > 0 else 0,
-                'window_p99': window_sorted[int(wn * 0.99)] if wn > 0 else 0,
-                'window_size': wn,
+                'throughput': self.jobs_processed / elapsed if elapsed > 0 else 0,
+                # Backward-compatible names = end-to-end.
+                'latency_p50': self._p(e2e_sorted, 0.50),
+                'latency_p95': self._p(e2e_sorted, 0.95),
+                'latency_p99': self._p(e2e_sorted, 0.99),
+                'latency_min': e2e_sorted[0],
+                'latency_max': e2e_sorted[-1],
+                'latency_avg': sum(e2e_sorted) / len(e2e_sorted),
+                # Explicit e2e.
+                'e2e_p50': self._p(e2e_sorted, 0.50),
+                'e2e_p95': self._p(e2e_sorted, 0.95),
+                'e2e_p99': self._p(e2e_sorted, 0.99),
+                # Service latency.
+                'service_p50': self._p(svc_sorted, 0.50),
+                'service_p95': self._p(svc_sorted, 0.95),
+                'service_p99': self._p(svc_sorted, 0.99),
+                'service_min': svc_sorted[0],
+                'service_max': svc_sorted[-1],
+                'service_avg': sum(svc_sorted) / len(svc_sorted),
+                # Window (since last snapshot) for time-series plots.
+                'window_e2e_p50': self._p(we2e_sorted, 0.50),
+                'window_e2e_p95': self._p(we2e_sorted, 0.95),
+                'window_e2e_p99': self._p(we2e_sorted, 0.99),
+                'window_service_p50': self._p(wsvc_sorted, 0.50),
+                'window_service_p95': self._p(wsvc_sorted, 0.95),
+                'window_service_p99': self._p(wsvc_sorted, 0.99),
+                'window_size': len(we2e_sorted),
             }
 
-            # Reset window
-            self._window_latencies = []
-            self._window_start = time.time()
-
+            self._window_e2e = []
+            self._window_service = []
             return metrics
 
     def save_metrics(self):
@@ -94,11 +118,9 @@ class ValkeyWorker:
         self.consumer_group = VALKEY_CONFIG['consumer_group']
         self.jobs_processed = 0
 
-        # Use Valkey-specific batch size
         self.batch_size = BENCHMARK['valkey_worker_batch_size']
         self.poll_interval = BENCHMARK['valkey_worker_poll_interval_ms']
 
-        # Ensure consumer group exists on all partitions
         for stream_key in self.stream_keys:
             try:
                 self.valkey.xgroup_create(
@@ -112,15 +134,13 @@ class ValkeyWorker:
                     print(f"[{self.worker_id}] Warning on {stream_key}: {e}")
 
     def simulate_processing(self):
-        """Simulate job processing"""
-        time.sleep(BENCHMARK['job_processing_time_ms'] / 1000.0)
+        ms = BENCHMARK['job_processing_time_ms']
+        if ms > 0:
+            time.sleep(ms / 1000.0)
 
     def process_messages(self):
-        """Process messages from partitioned Valkey Streams"""
         try:
-            # Build streams dict for XREADGROUP across ALL partitions
             streams_dict = {key: '>' for key in self.stream_keys}
-
             messages = self.valkey.xreadgroup(
                 groupname=self.consumer_group,
                 consumername=self.worker_id,
@@ -132,53 +152,42 @@ class ValkeyWorker:
             if not messages:
                 return 0
 
-            # Group message IDs by stream key for batch acknowledgment
+            # Dequeue timestamp is the moment XREADGROUP returned; service
+            # latency measures from there to each per-message ack.
+            dequeue_ts = datetime.now()
+
             ack_by_stream = {}
-            batch_latencies = []
+            pairs = []
 
             for stream_name, stream_messages in messages:
-                # stream_name is bytes
-                if isinstance(stream_name, bytes):
-                    stream_name_str = stream_name.decode('utf-8')
-                else:
-                    stream_name_str = stream_name
+                stream_name_str = stream_name.decode('utf-8') if isinstance(stream_name, bytes) else stream_name
 
                 for message_id, message_data in stream_messages:
                     try:
                         created_at_str = message_data.get(b'created_at', b'').decode('utf-8')
+                        created_at = datetime.fromisoformat(created_at_str) if created_at_str else datetime.now()
 
-                        if created_at_str:
-                            created_at = datetime.fromisoformat(created_at_str)
-                        else:
-                            created_at = datetime.now()
-
-                        # Simulate processing
                         self.simulate_processing()
 
-                        # Calculate latency
-                        latency_ms = (datetime.now() - created_at).total_seconds() * 1000
-                        batch_latencies.append(latency_ms)
+                        ack_ts = datetime.now()
+                        e2e_ms = (ack_ts - created_at).total_seconds() * 1000
+                        service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
+                        pairs.append((e2e_ms, service_ms))
 
-                        # Add to per-stream ack batch
-                        if stream_name_str not in ack_by_stream:
-                            ack_by_stream[stream_name_str] = []
-                        ack_by_stream[stream_name_str].append(message_id)
+                        ack_by_stream.setdefault(stream_name_str, []).append(message_id)
                         self.jobs_processed += 1
-
                     except Exception as e:
                         print(f"[{self.worker_id}] Error processing message {message_id}: {e}")
                         continue
 
-            # Batch acknowledge per stream partition
             for stream_key, msg_ids in ack_by_stream.items():
                 try:
                     self.valkey.xack(stream_key, self.consumer_group, *msg_ids)
                 except Exception as e:
                     print(f"[{self.worker_id}] Error acking on {stream_key}: {e}")
 
-            # Record metrics for entire batch
-            if batch_latencies:
-                self.metrics.record_jobs(batch_latencies)
+            if pairs:
+                self.metrics.record_jobs(pairs)
 
             return sum(len(ids) for ids in ack_by_stream.values())
 
@@ -188,36 +197,29 @@ class ValkeyWorker:
                 for stream_key in self.stream_keys:
                     try:
                         self.valkey.xgroup_create(
-                            name=stream_key,
-                            groupname=self.consumer_group,
-                            id='0',
-                            mkstream=True
-                        )
-                    except:
+                            name=stream_key, groupname=self.consumer_group,
+                            id='0', mkstream=True)
+                    except Exception:
                         pass
             else:
                 print(f"[{self.worker_id}] Error reading streams: {e}")
             return 0
 
     def claim_pending_messages(self):
-        """Claim pending messages that timed out from other consumers (across all partitions)"""
+        """Claim pending messages that timed out from other consumers."""
         total_claimed = 0
 
         for stream_key in self.stream_keys:
             try:
                 pending = self.valkey.xpending_range(
-                    name=stream_key,
-                    groupname=self.consumer_group,
-                    min='-',
-                    max='+',
-                    count=10
-                )
+                    name=stream_key, groupname=self.consumer_group,
+                    min='-', max='+', count=10)
 
                 if not pending:
                     continue
 
                 claimed_ids = []
-                batch_latencies = []
+                pairs = []
 
                 for msg in pending:
                     message_id = msg['message_id']
@@ -234,35 +236,33 @@ class ValkeyWorker:
                             )
 
                             if result:
+                                claim_ts = datetime.now()
                                 for msg_id, msg_data in result:
                                     created_at_str = msg_data.get(b'created_at', b'').decode('utf-8')
-                                    if created_at_str:
-                                        created_at = datetime.fromisoformat(created_at_str)
-                                    else:
-                                        created_at = datetime.now()
+                                    created_at = datetime.fromisoformat(created_at_str) if created_at_str else datetime.now()
 
                                     self.simulate_processing()
 
-                                    latency_ms = (datetime.now() - created_at).total_seconds() * 1000
-                                    batch_latencies.append(latency_ms)
+                                    ack_ts = datetime.now()
+                                    e2e_ms = (ack_ts - created_at).total_seconds() * 1000
+                                    service_ms = (ack_ts - claim_ts).total_seconds() * 1000
+                                    pairs.append((e2e_ms, service_ms))
                                     claimed_ids.append(msg_id)
                                     self.jobs_processed += 1
-
                         except Exception as e:
-                            print(f"[{self.worker_id}] Error claiming {message_id} on {stream_key}: {e}")
+                            print(f"[{self.worker_id}] Error claiming {message_id}: {e}")
                             continue
 
                 if claimed_ids:
                     try:
                         self.valkey.xack(stream_key, self.consumer_group, *claimed_ids)
                     except Exception as e:
-                        print(f"[{self.worker_id}] Error acking claimed on {stream_key}: {e}")
+                        print(f"[{self.worker_id}] Error acking claimed: {e}")
 
-                if batch_latencies:
-                    self.metrics.record_jobs(batch_latencies)
+                if pairs:
+                    self.metrics.record_jobs(pairs)
 
                 total_claimed += len(claimed_ids)
-
             except Exception as e:
                 print(f"[{self.worker_id}] Error claiming on {stream_key}: {e}")
                 continue
@@ -270,20 +270,15 @@ class ValkeyWorker:
         return total_claimed
 
     def run(self):
-        """Main worker loop"""
         print(f"[{self.worker_id}] Started (batch={self.batch_size}, partitions={len(self.stream_keys)})")
-
         claim_counter = 0
-
         try:
             while self.running.is_set():
-                processed = self.process_messages()
-
+                self.process_messages()
                 claim_counter += 1
                 if claim_counter >= 10:
                     self.claim_pending_messages()
                     claim_counter = 0
-
         except KeyboardInterrupt:
             pass
         finally:
@@ -297,11 +292,11 @@ class ValkeyWorker:
 def main():
     parser = argparse.ArgumentParser(description='Valkey Streams worker (partitioned, batched)')
     parser.add_argument('--workers', type=int, default=BENCHMARK['num_workers'],
-                       help='Number of worker threads')
+                        help='Number of worker threads')
     parser.add_argument('--output', default='metrics_valkey.jsonl',
-                       help='Metrics output file')
+                        help='Metrics output file')
     parser.add_argument('--batch-size', type=int, default=None,
-                       help='Override batch size from config')
+                        help='Override batch size from config')
 
     args = parser.parse_args()
 
@@ -314,37 +309,30 @@ def main():
     print(f"Stream partitions: {len(stream_keys)} ({', '.join(stream_keys)})")
     print(f"Consumer group: {VALKEY_CONFIG['consumer_group']}")
     print(f"Batch size: {BENCHMARK['valkey_worker_batch_size']} messages per fetch")
+    print(f"Processing time per job: {BENCHMARK['job_processing_time_ms']}ms (simulated)")
     print(f"Poll interval: {BENCHMARK['valkey_worker_poll_interval_ms']} ms")
     print(f"Metrics output: {args.output}")
     print("-" * 50)
 
-    # Metrics collector
     metrics = MetricsCollector(args.output)
 
-    # Create workers
     workers = []
     threads = []
-
     for i in range(args.workers):
         worker = ValkeyWorker(i, metrics)
-        thread = Thread(target=worker.run)
-        thread.daemon = True
+        thread = Thread(target=worker.run, daemon=True)
         thread.start()
-
         workers.append(worker)
         threads.append(thread)
 
-    # Periodic metrics collection
     def collect_metrics():
         while True:
             time.sleep(BENCHMARK['metrics_interval'])
             metrics.save_metrics()
 
-    metrics_thread = Thread(target=collect_metrics)
-    metrics_thread.daemon = True
+    metrics_thread = Thread(target=collect_metrics, daemon=True)
     metrics_thread.start()
 
-    # Wait for interrupt
     def signal_handler(sig, frame):
         print("\nStopping workers...")
         for worker in workers:
@@ -354,7 +342,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Wait for all threads
     for thread in threads:
         thread.join()
 

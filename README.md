@@ -1,4 +1,4 @@
-# Queue Architecture Benchmark: PostgreSQL vs Valkey Streams
+# Queue Architecture Benchmark: PostgreSQL vs Valkey vs Kafka vs RabbitMQ
 
 ## Table of Contents
 
@@ -21,21 +21,23 @@
 
 ## Overview
 
-This benchmark framework provides a comprehensive, reproducible methodology for comparing **database-backed queue tables** with **in-memory Valkey Streams** under realistic load conditions.
+This benchmark framework provides a comprehensive, reproducible methodology for comparing four single-node queue systems — **PostgreSQL queue tables**, **Valkey Streams**, **Kafka**, and **RabbitMQ** — under realistic load conditions.
 
-This is not a fight. It is a benchmark to help you understand when each tool fits. PostgreSQL wins on durability, simplicity, and median latency. Valkey wins on throughput stability, tail latency, and CPU efficiency under load.
+This is not a fight. It is a benchmark to help you understand when each tool fits. PostgreSQL wins on durability, simplicity, and ecosystem. Valkey wins on tail latency and CPU efficiency. Kafka wins on sustained high-rate throughput and replay. RabbitMQ wins on routing flexibility and operational maturity. Their weaknesses are the inverse of their strengths; pick based on workload shape.
 
 ### What Gets Tested
 
-- **4 Queue Implementations**: 3 PostgreSQL variants + 1 Valkey Streams
-- **3 Test Scenarios**: Cold start, warm system, mixed load
-- **5 Runs Per Scenario**: For statistical rigor (mean +/- stddev)
-- **Key Metrics**: Throughput, tail latency (p50/p95/p99), CPU usage, memory
+- **8 Queue Implementations**: 4 PostgreSQL variants + 1 Valkey Streams + 1 Kafka + 2 RabbitMQ variants
+- **3 Test Scenarios**: Cold start, warm system, mixed load (identical pgbench background across all VMs)
+- **5 Runs Per Scenario**: For statistical rigor (mean ± stddev + bootstrap CIs for tail latency)
+- **Key Metrics**: Throughput, tail latency (p50/p95/p99, both service and end-to-end), CPU usage, memory
 
 ### Test Duration
 
-- **VM1 (PostgreSQL)**: ~10-12 hours (9 tests x 5 runs each)
-- **VM2 (Valkey)**: ~3-4 hours (3 tests x 5 runs each)
+- **VM1 (PostgreSQL, 4 variants)**: ~10–12h (12 tests × 5 runs)
+- **VM2 (Valkey)**: ~3–4h (3 tests × 5 runs)
+- **VM3 (Kafka)**: ~4–5h (3 tests × 5 runs)
+- **VM4 (RabbitMQ, 2 variants)**: ~6–8h (6 tests × 5 runs)
 - **Analysis**: ~5 minutes
 
 ---
@@ -45,10 +47,10 @@ This is not a fight. It is a benchmark to help you understand when each tool fit
 ### Benchmark Fairness Principle
 
 - **Fairness means realistic deployments**, not hardware parity.
-- The comparison is: **1 PostgreSQL node** (how most teams deploy a PG-backed queue) vs **1 Valkey standalone node** (properly configured, no clustering).
-- A Valkey cluster (3+ nodes) vs 1 PG node would be unfair.
-- A misconfigured single-node Valkey (hot-shard) would also be unfair.
-- Each system is tested at its **best single-node configuration**, matching what a real team would deploy.
+- The comparison is **one node per system**, each tuned to its best single-node configuration: 1 PG node, 1 Valkey standalone, 1 Kafka broker (KRaft, 8 partitions, replication factor 1), 1 RabbitMQ node (classic + quorum queues).
+- A Kafka cluster (3+ brokers) or RabbitMQ cluster against the others would be unfair. So would a misconfigured single-node Valkey (hot-shard), a 1-partition Kafka topic, or a non-durable RabbitMQ queue. Every system is given its best shot at fair single-node performance.
+- **Caveat — quorum queues on single-node RabbitMQ**: the Raft durability guarantee is degenerate without replicas. Throughput/latency numbers are still informative; durability numbers are not. Documented in environment.txt per run.
+- **Caveat — single-broker Kafka with replication_factor=1**: atypical production deployment. Documented similarly.
 
 ### Research Questions
 
@@ -62,22 +64,24 @@ This is not a fight. It is a benchmark to help you understand when each tool fit
 
 ## Decision Guide
 
-Use this quick-reference to decide which queue technology fits your use case:
+Quick reference. Cluster deployments shift the tradeoffs; these notes are for single-node setups.
 
-| Criterion | PostgreSQL Queue | Valkey Streams |
-|---|---|---|
-| **Throughput** | < 500 jobs/sec | > 500 jobs/sec |
-| **Traffic pattern** | Stable / predictable | Bursty / variable |
-| **p95/p99 SLA** | Not required | Required |
-| **Job durability** | Critical (financial) | Best-effort acceptable |
-| **Operational overhead** | Prefer fewer systems | Dedicated infra OK |
-| **Query flexibility** | Needed (filter/report) | Not needed |
+| Criterion | PostgreSQL | Valkey Streams | Kafka | RabbitMQ |
+|---|---|---|---|---|
+| **Throughput**         | < 500 j/s                    | > 500 j/s, bursty                      | > 10k j/s                        | 500–5k j/s                               |
+| **Traffic pattern**    | Stable / predictable         | Bursty / variable                      | Sustained high-rate              | Mixed, short-lived jobs                  |
+| **p95/p99 SLA**        | Not required                 | Required                               | Required (high-volume)           | Moderate (quorum relaxes tails)          |
+| **Durability**         | Critical (WAL)               | Best-effort acceptable                 | Strong (replicated log, needs ≥3)| Strong (quorum ≥3) / medium (classic)    |
+| **Operational overhead**| Prefer fewer systems        | Dedicated infra OK                     | Significant (KRaft ops)          | Moderate (Erlang expertise)              |
+| **Replay / history**   | Not supported                | Limited (stream history)               | First-class                      | Not supported                            |
+| **Routing flexibility**| SQL filter in queries only   | None                                   | Partition keys only              | Exchanges, bindings, topic routing       |
 
-**Use PostgreSQL** for payment processing, user operations, small teams preferring simplicity, and moderate throughput (<500 j/s).
+- **PostgreSQL** — payment processing, user ops, small teams who'd rather not run another system. Best when throughput is moderate and WAL-level durability is the priority.
+- **Valkey Streams** — event processing, high-volume background jobs, strict tail-latency SLAs. Best when the cost of an in-memory store is acceptable and durability can be best-effort.
+- **Kafka** — sustained high-rate ingestion, event replay, analytics pipelines. Shines at 10k+ j/s and when multiple consumers need to replay the same stream.
+- **RabbitMQ** — complex routing (exchanges, bindings, headers), heterogeneous job types, per-message priorities. Quorum queues when durability matters; classic queues when latency does.
 
-**Use Valkey** for analytics pipelines, event processing, high-volume background jobs, and systems with strict latency SLAs.
-
-**Hybrid approach**: Use PostgreSQL's durability for critical operations, Valkey's performance for high volume.
+**Hybrid setups** are common: PostgreSQL for critical transactions, one of the brokers for high-volume fan-out.
 
 ---
 

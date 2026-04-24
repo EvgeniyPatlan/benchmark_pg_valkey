@@ -13,11 +13,37 @@
 set -e
 
 # Configuration
-RESULTS_DIR="./results/vm1_pg"
+RESULTS_DIR="${RESULTS_DIR:-./results/vm1_pg}"
 BENCHMARK_DIR="./benchmark"
-QUEUE_TYPES=("skip_locked" "delete_returning" "partitioned")
+# Queue variants exercised. skip_locked_batch (reviewer concern #3) is the
+# apples-to-apples comparison against Valkey's batched XREADGROUP.
+QUEUE_TYPES=("skip_locked" "delete_returning" "partitioned" "skip_locked_batch")
 SCENARIOS=("cold" "warm" "load")
 NUM_RUNS=${1:-5}  # Default 5 runs per scenario, override via first argument
+
+# Durability mode: none | matched | strict. Default 'none' preserves legacy
+# behavior (synchronous_commit on, Valkey appendonly off). 'matched' sets
+# synchronous_commit=off so PG and Valkey (appendfsync everysec) have
+# comparable durability ceilings (reviewer concern #2).
+DURABILITY_MODE="${DURABILITY_MODE:-none}"
+export DURABILITY_MODE
+
+# Worker count. Partitioned queue (reviewer concern #5) benefits from higher
+# concurrency so there are >=2 workers per partition; override via env.
+NUM_WORKERS="${NUM_WORKERS:-20}"
+NUM_WORKERS_PARTITIONED="${NUM_WORKERS_PARTITIONED:-48}"
+
+# Simulated processing time per job (reviewer concern #4). Default 5ms
+# preserves legacy; set JOB_PROCESSING_TIME_MS=50 for a realistic workload
+# that exercises row-lock contention.
+export JOB_PROCESSING_TIME_MS="${JOB_PROCESSING_TIME_MS:-5}"
+
+# Producer arrival rate. If PRODUCER_AUTO_CAP=1, the producer caps at 90%
+# of measured service capacity from results/capacity.json so arrival rate
+# never exceeds service rate (reviewer concern #1).
+PRODUCER_AUTO_CAP="${PRODUCER_AUTO_CAP:-0}"
+PRODUCER_RATE="${PRODUCER_RATE:-1000}"
+CAPACITY_FILE="${CAPACITY_FILE:-results/capacity.json}"
 
 # Check PGPASSWORD is set
 if [ -z "$PGPASSWORD" ]; then
@@ -68,7 +94,46 @@ save_environment() {
     echo "  Job size: 512 bytes" >> "$env_file"
     echo "  Processing time: 5ms (simulated)" >> "$env_file"
     echo "  Runs per scenario: $NUM_RUNS" >> "$env_file"
+    echo "  Workers (default): $NUM_WORKERS" >> "$env_file"
+    echo "  Workers (partitioned): $NUM_WORKERS_PARTITIONED" >> "$env_file"
+    echo "  Job processing time: ${JOB_PROCESSING_TIME_MS}ms (simulated)" >> "$env_file"
+    echo "  Durability mode: $DURABILITY_MODE" >> "$env_file"
+    echo "  Producer auto-cap: $PRODUCER_AUTO_CAP (fraction=0.9, capacity=$CAPACITY_FILE)" >> "$env_file"
+    echo "  synchronous_commit: $(psql -h localhost -t -A -c 'SHOW synchronous_commit;' 2>/dev/null || echo unknown)" >> "$env_file"
+    echo "" >> "$env_file"
+    echo "Queue variants tested: ${QUEUE_TYPES[*]}" >> "$env_file"
     echo "Saved environment info to $env_file"
+}
+
+# Apply the requested durability mode. ALTER SYSTEM + pg_reload_conf()
+# require PG superuser privileges, so these commands run as the 'postgres'
+# OS user via sudo rather than as bench_user. Only PostgreSQL is affected
+# here; Valkey mode is handled in run_valkey_tests.sh.
+apply_durability_mode() {
+    local pg_admin
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        pg_admin="sudo -u postgres psql"
+    elif [ "$(id -un)" = "postgres" ]; then
+        pg_admin="psql"
+    else
+        pg_admin="sudo -u postgres psql"
+    fi
+
+    case "$DURABILITY_MODE" in
+        none|strict)
+            echo "Durability mode = $DURABILITY_MODE (synchronous_commit=on)"
+            $pg_admin -c "ALTER SYSTEM SET synchronous_commit = on;" > /dev/null
+            ;;
+        matched)
+            echo "Durability mode = matched (synchronous_commit=off, equivalent to Valkey appendfsync everysec)"
+            $pg_admin -c "ALTER SYSTEM SET synchronous_commit = off;" > /dev/null
+            ;;
+        *)
+            echo "ERROR: unknown DURABILITY_MODE=$DURABILITY_MODE"
+            exit 1
+            ;;
+    esac
+    $pg_admin -c "SELECT pg_reload_conf();" > /dev/null
 }
 
 # Function to clean database
@@ -77,7 +142,8 @@ clean_database() {
     echo "Cleaning database for $queue_type..."
 
     case $queue_type in
-        "skip_locked")
+        "skip_locked"|"skip_locked_batch")
+            # skip_locked_batch shares the queue_jobs table with skip_locked.
             psql -h localhost -c "TRUNCATE queue_jobs;"
             ;;
         "delete_returning")
@@ -86,6 +152,15 @@ clean_database() {
         "partitioned")
             psql -h localhost -c "TRUNCATE queue_jobs_part;"
             ;;
+    esac
+}
+
+# Choose worker count per queue variant. Partitioned gets more workers so
+# concurrency per partition is >=2 (reviewer concern #5).
+workers_for() {
+    case "$1" in
+        partitioned) echo "$NUM_WORKERS_PARTITIONED" ;;
+        *) echo "$NUM_WORKERS" ;;
     esac
 }
 
@@ -152,21 +227,32 @@ run_benchmark() {
     # Clean database
     clean_database "$queue_type"
 
+    local worker_count
+    worker_count=$(workers_for "$queue_type")
+
+    # Build producer args once so warmup and the main run are identical
+    # in rate-capping behavior.
+    local producer_extra=()
+    if [ "$PRODUCER_AUTO_CAP" == "1" ]; then
+        producer_extra=(--auto-cap --capacity-file "$CAPACITY_FILE")
+    fi
+
     # Handle scenario-specific setup
     if [ "$scenario" == "warm" ]; then
         echo "Warming up system..."
 
         python3 "$BENCHMARK_DIR/worker_pg.py" \
             --queue-type "$queue_type" \
-            --workers 20 \
+            --workers "$worker_count" \
             --output "${result_prefix}_warmup_metrics.jsonl" &
         WORKER_PID=$!
 
         python3 "$BENCHMARK_DIR/producer.py" \
             --backend pg \
             --queue-type "$queue_type" \
-            --rate 1000 \
-            --duration 60
+            --rate "$PRODUCER_RATE" \
+            --duration 60 \
+            "${producer_extra[@]}"
 
         echo "Waiting for workers to process warmup jobs..."
         sleep 30
@@ -215,22 +301,23 @@ run_benchmark() {
     fi
 
     # Start workers
-    echo "Starting workers..."
+    echo "Starting workers ($worker_count)..."
     python3 "$BENCHMARK_DIR/worker_pg.py" \
         --queue-type "$queue_type" \
-        --workers 20 \
+        --workers "$worker_count" \
         --output "${result_prefix}_metrics.jsonl" &
     WORKER_PID=$!
 
     sleep 2
 
     # Start producer
-    echo "Starting producer (1000 jobs/sec for 180 seconds)..."
+    echo "Starting producer (${PRODUCER_RATE} jobs/sec for 180 seconds, auto-cap=$PRODUCER_AUTO_CAP)..."
     python3 "$BENCHMARK_DIR/producer.py" \
         --backend pg \
         --queue-type "$queue_type" \
-        --rate 1000 \
+        --rate "$PRODUCER_RATE" \
         --duration 180 \
+        "${producer_extra[@]}" \
         > "${result_prefix}_producer.log" 2>&1
 
     echo "Producer finished. Waiting for workers to complete remaining jobs..."
@@ -242,7 +329,7 @@ run_benchmark() {
 
     while [ $ELAPSED -lt $MAX_WAIT ]; do
         case $queue_type in
-            "skip_locked")
+            "skip_locked"|"skip_locked_batch")
                 PENDING=$(psql -h localhost -t -c "SELECT count(*) FROM queue_jobs WHERE status='pending';")
                 ;;
             "delete_returning")
@@ -300,6 +387,10 @@ echo "PostgreSQL Queue Benchmark Suite"
 echo "Results directory: $RESULTS_DIR"
 echo "Runs per scenario: $NUM_RUNS"
 echo ""
+
+# Apply durability mode before saving environment so SHOW synchronous_commit
+# reflects the active setting in environment.txt.
+apply_durability_mode
 
 # Save environment
 save_environment

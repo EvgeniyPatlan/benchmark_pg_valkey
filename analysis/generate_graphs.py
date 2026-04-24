@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
 Generate comparison graphs from benchmark results.
-Creates publication-quality visualizations with:
-- Error bars (stddev) for multi-run data
-- Annotated charts with clear captions
-- Batching comparison chart
-- Decision reference visualization
+
+Changes vs legacy version (all driven by reviewer concerns):
+  - Latency error bars for p95/p99 use asymmetric bootstrap 95% CIs
+    (from analyze.py's *_ci95_bootstrap_lo/hi columns) instead of
+    symmetric Gaussian stddev, which is wrong for skewed tail metrics.
+  - New plot_service_vs_e2e(): side-by-side bars showing service
+    latency (dequeue -> ack) vs end-to-end latency (enqueue -> ack)
+    so a reviewer can see at a glance how much of p95 is queue
+    buildup vs database processing.
+  - All per-variant plots include skip_locked_batch automatically
+    because they iterate self.df; no hardcoded variant list.
 """
 import argparse
 import os
@@ -20,10 +26,22 @@ sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 6)
 plt.rcParams['font.size'] = 10
 
-# Color scheme
+# Color scheme (per backend; one color for all variants of each backend)
 COLOR_VALKEY = '#2ecc71'
 COLOR_PG = '#3498db'
 COLOR_PG_DARK = '#2980b9'
+COLOR_KAFKA = '#e74c3c'       # red family for Kafka
+COLOR_RABBITMQ = '#f39c12'    # orange family for RabbitMQ (broker tradition)
+COLOR_SERVICE = '#9b59b6'     # service latency bars (dequeue -> ack)
+COLOR_E2E = '#16a085'         # end-to-end latency bars (distinct from RabbitMQ orange)
+
+BACKEND_COLORS = {
+    'postgresql': COLOR_PG,
+    'pg': COLOR_PG,
+    'valkey': COLOR_VALKEY,
+    'kafka': COLOR_KAFKA,
+    'rabbitmq': COLOR_RABBITMQ,
+}
 
 
 def _has_aggregated_columns(df):
@@ -50,22 +68,62 @@ class GraphGenerator:
         self.tp_col = 'avg_throughput_mean' if self.is_aggregated else 'avg_throughput'
         self.tp_err_col = 'avg_throughput_stddev' if self.is_aggregated else None
 
-        # Latency columns
+        # Latency columns (end-to-end = latency_*; service = service_*).
+        # *_err is the stddev for symmetric error bars.
+        # *_ci_lo/hi are column names for bootstrap CI bounds (absolute
+        # latency values, which get_err_deltas() converts to offsets).
         self.lat_cols = {}
         for p in ['p50', 'p95', 'p99']:
             if self.is_aggregated:
                 self.lat_cols[p] = f'latency_{p}_ms_mean'
                 self.lat_cols[f'{p}_err'] = f'latency_{p}_ms_stddev'
+                self.lat_cols[f'{p}_ci_lo'] = f'latency_{p}_ms_ci95_bootstrap_lo'
+                self.lat_cols[f'{p}_ci_hi'] = f'latency_{p}_ms_ci95_bootstrap_hi'
+                # Service latency counterparts (may be missing in legacy runs).
+                self.lat_cols[f'service_{p}'] = f'service_{p}_ms_mean'
+                self.lat_cols[f'service_{p}_err'] = f'service_{p}_ms_stddev'
+                self.lat_cols[f'service_{p}_ci_lo'] = f'service_{p}_ms_ci95_bootstrap_lo'
+                self.lat_cols[f'service_{p}_ci_hi'] = f'service_{p}_ms_ci95_bootstrap_hi'
             else:
                 self.lat_cols[p] = f'latency_{p}_ms'
                 self.lat_cols[f'{p}_err'] = None
+                self.lat_cols[f'{p}_ci_lo'] = None
+                self.lat_cols[f'{p}_ci_hi'] = None
+                self.lat_cols[f'service_{p}'] = f'service_{p}_ms'
+                self.lat_cols[f'service_{p}_err'] = None
+
+        # True if this run has service latency columns (i.e., post-reviewer
+        # worker changes). Drives whether plot_service_vs_e2e runs.
+        self.has_service_latency = (
+            self.is_aggregated
+            and 'service_p95_ms_mean' in self.df.columns
+            and not self.df['service_p95_ms_mean'].isna().all()
+        )
 
         # CPU column
         self.cpu_col = 'avg_cpu_user_mean' if self.is_aggregated else 'avg_cpu_user'
 
+    def _err_deltas(self, data, mean_col, lo_col, hi_col, stddev_col=None):
+        """Return (lower_delta, upper_delta) arrays for matplotlib error bars.
+
+        Prefers bootstrap CI columns if present; falls back to stddev for
+        backward compat. matplotlib expects non-negative offsets from the
+        central value, so we convert absolute CI bounds into deltas.
+        """
+        if (lo_col and hi_col
+                and lo_col in data.columns and hi_col in data.columns
+                and not data[lo_col].isna().all()):
+            lower = (data[mean_col] - data[lo_col]).clip(lower=0).values
+            upper = (data[hi_col] - data[mean_col]).clip(lower=0).values
+            return np.vstack([lower, upper])
+        if stddev_col and stddev_col in data.columns:
+            return data[stddev_col].values
+        return None
+
     def _get_colors(self, backends):
-        """Get color list based on backend type"""
-        return [COLOR_VALKEY if 'valkey' in str(b).lower() else COLOR_PG for b in backends]
+        """Map backend names to their representative color. Unknown backends
+        fall back to PG blue so the graph doesn't crash on new backends."""
+        return [BACKEND_COLORS.get(str(b).lower(), COLOR_PG) for b in backends]
 
     def plot_throughput_comparison(self):
         """Compare throughput across all implementations with error bars"""
@@ -96,11 +154,16 @@ class GraphGenerator:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (yerr[i] if yerr is not None else 0) + 20,
                        f'{val:.0f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
 
-        # Legend
-        legend_patches = [
-            mpatches.Patch(color=COLOR_VALKEY, label='Valkey Streams'),
-            mpatches.Patch(color=COLOR_PG, label='PostgreSQL'),
+        # Legend reflects only the backends actually present in the data
+        present = set(self.df['backend'].dropna().astype(str).str.lower())
+        label_map = [
+            ('postgresql', 'PostgreSQL', COLOR_PG),
+            ('valkey',     'Valkey Streams', COLOR_VALKEY),
+            ('kafka',      'Kafka', COLOR_KAFKA),
+            ('rabbitmq',   'RabbitMQ', COLOR_RABBITMQ),
         ]
+        legend_patches = [mpatches.Patch(color=c, label=lbl)
+                          for key, lbl, c in label_map if key in present]
         fig.legend(handles=legend_patches, loc='upper right', fontsize=9)
 
         plt.tight_layout()
@@ -122,14 +185,21 @@ class GraphGenerator:
             for col_idx, (pct, label) in enumerate(zip(percentiles, percentile_labels)):
                 ax = axes[row_idx, col_idx]
                 col = self.lat_cols[pct]
-                err_col = self.lat_cols.get(f'{pct}_err')
                 data = self.df[self.df['scenario'] == scenario].sort_values(col)
 
                 if data.empty:
                     continue
 
                 colors = self._get_colors(data['backend'])
-                xerr = data[err_col].values if err_col and err_col in data.columns else None
+                # Prefer bootstrap CIs (asymmetric) for tails — Gaussian
+                # symmetric CIs are badly wrong for right-skewed p95/p99.
+                xerr = self._err_deltas(
+                    data,
+                    mean_col=col,
+                    lo_col=self.lat_cols.get(f'{pct}_ci_lo'),
+                    hi_col=self.lat_cols.get(f'{pct}_ci_hi'),
+                    stddev_col=self.lat_cols.get(f'{pct}_err'),
+                )
 
                 bars = ax.barh(range(len(data)), data[col], color=colors, alpha=0.85,
                               xerr=xerr, capsize=3)
@@ -139,8 +209,17 @@ class GraphGenerator:
                 ax.set_title(f'{scenario.title()} - {label}', fontsize=10, fontweight='bold')
                 ax.grid(axis='x', alpha=0.3)
 
+                # Pull per-row upper error for label positioning.
+                if xerr is not None and np.ndim(xerr) == 2:
+                    upper_err = xerr[1]
+                elif xerr is not None:
+                    upper_err = np.asarray(xerr)
+                else:
+                    upper_err = None
+
                 for i, (bar, val) in enumerate(zip(bars, data[col])):
-                    ax.text(val + (xerr[i] if xerr is not None else val * 0.02) + 1,
+                    offset = (upper_err[i] if upper_err is not None else val * 0.02) + 1
+                    ax.text(val + offset,
                            bar.get_y() + bar.get_height()/2,
                            f'{val:.1f}', ha='left', va='center', fontsize=7)
 
@@ -175,7 +254,7 @@ class GraphGenerator:
                 synthetic = [p50] * 50 + [p95] * 45 + [p99] * 5
                 latency_data.append(synthetic)
                 labels.append(row['label'])
-                colors.append(COLOR_VALKEY if 'valkey' in row['backend'] else COLOR_PG)
+                colors.append(BACKEND_COLORS.get(str(row['backend']).lower(), COLOR_PG))
 
             bp = ax.boxplot(latency_data, labels=labels, patch_artist=True)
 
@@ -183,15 +262,17 @@ class GraphGenerator:
                 patch.set_facecolor(color)
                 patch.set_alpha(0.6)
 
-            # Annotate Valkey's tiny box
-            for i, (label, color) in enumerate(zip(labels, colors)):
-                if color == COLOR_VALKEY:
-                    ax.annotate('Tight distribution',
-                              xy=(i + 1, latency_data[i][-1]),
-                              xytext=(i + 1.3, latency_data[i][-1] * 1.5),
-                              fontsize=7, color=COLOR_VALKEY, fontweight='bold',
-                              arrowprops=dict(arrowstyle='->', color=COLOR_VALKEY, lw=1))
-                    break
+            # Annotate the tightest distribution (smallest p99-p50 span) —
+            # used to be Valkey-specific; generalized so Kafka/RabbitMQ
+            # can win this on their data.
+            if latency_data:
+                spans = [(max(ld) - min(ld), i) for i, ld in enumerate(latency_data)]
+                _, tight_idx = min(spans)
+                ax.annotate('Tightest distribution',
+                            xy=(tight_idx + 1, latency_data[tight_idx][-1]),
+                            xytext=(tight_idx + 1.3, latency_data[tight_idx][-1] * 1.5),
+                            fontsize=7, color=colors[tight_idx], fontweight='bold',
+                            arrowprops=dict(arrowstyle='->', color=colors[tight_idx], lw=1))
 
             ax.set_ylabel('Latency (ms)', fontsize=10)
             ax.set_title(f'{scenario.title()} Start', fontsize=12, fontweight='bold')
@@ -260,13 +341,12 @@ class GraphGenerator:
         ax = axes[0, 0]
         for impl in implementations:
             data = self.df[self.df['label'] == impl]
-            color = COLOR_VALKEY if 'valkey' in data['backend'].iloc[0] else COLOR_PG
+            color = BACKEND_COLORS.get(str(data['backend'].iloc[0]).lower(), COLOR_PG)
             throughput = [data[data['scenario'] == s][self.tp_col].values[0]
                          if len(data[data['scenario'] == s]) > 0 else 0
                          for s in scenarios]
-            lw = 3 if color == COLOR_VALKEY else 1.5
             ax.plot(scenarios, throughput, marker='o', label=impl.replace('\n', ' '),
-                   linewidth=lw, color=color, alpha=0.8 if color == COLOR_PG else 1.0)
+                   linewidth=2.0, color=color, alpha=0.9)
 
         ax.set_ylabel('Throughput (jobs/sec)', fontsize=10)
         ax.set_title('Throughput Across Scenarios', fontsize=12, fontweight='bold')
@@ -277,13 +357,12 @@ class GraphGenerator:
         ax = axes[0, 1]
         for impl in implementations:
             data = self.df[self.df['label'] == impl]
-            color = COLOR_VALKEY if 'valkey' in data['backend'].iloc[0] else COLOR_PG
+            color = BACKEND_COLORS.get(str(data['backend'].iloc[0]).lower(), COLOR_PG)
             latency = [data[data['scenario'] == s][self.lat_cols['p95']].values[0]
                       if len(data[data['scenario'] == s]) > 0 else 0
                       for s in scenarios]
-            lw = 3 if color == COLOR_VALKEY else 1.5
             ax.plot(scenarios, latency, marker='o', label=impl.replace('\n', ' '),
-                   linewidth=lw, color=color, alpha=0.8 if color == COLOR_PG else 1.0)
+                   linewidth=2.0, color=color, alpha=0.9)
 
         ax.set_ylabel('p95 Latency (ms)', fontsize=10)
         ax.set_title('p95 Latency Across Scenarios', fontsize=12, fontweight='bold')
@@ -294,13 +373,12 @@ class GraphGenerator:
         ax = axes[1, 0]
         for impl in implementations:
             data = self.df[self.df['label'] == impl]
-            color = COLOR_VALKEY if 'valkey' in data['backend'].iloc[0] else COLOR_PG
+            color = BACKEND_COLORS.get(str(data['backend'].iloc[0]).lower(), COLOR_PG)
             latency = [data[data['scenario'] == s][self.lat_cols['p99']].values[0]
                       if len(data[data['scenario'] == s]) > 0 else 0
                       for s in scenarios]
-            lw = 3 if color == COLOR_VALKEY else 1.5
             ax.plot(scenarios, latency, marker='o', label=impl.replace('\n', ' '),
-                   linewidth=lw, color=color, alpha=0.8 if color == COLOR_PG else 1.0)
+                   linewidth=2.0, color=color, alpha=0.9)
 
         ax.set_ylabel('p99 Latency (ms)', fontsize=10)
         ax.set_title('p99 Latency Across Scenarios', fontsize=12, fontweight='bold')
@@ -312,16 +390,15 @@ class GraphGenerator:
         if self.is_aggregated and self.tp_err_col in self.df.columns:
             for impl in implementations:
                 data = self.df[self.df['label'] == impl]
-                color = COLOR_VALKEY if 'valkey' in data['backend'].iloc[0] else COLOR_PG
+                color = BACKEND_COLORS.get(str(data['backend'].iloc[0]).lower(), COLOR_PG)
                 cv = [data[data['scenario'] == s][self.tp_err_col].values[0] /
                       data[data['scenario'] == s][self.tp_col].values[0] * 100
                       if len(data[data['scenario'] == s]) > 0 and
                          data[data['scenario'] == s][self.tp_col].values[0] > 0
                       else 0
                       for s in scenarios]
-                lw = 3 if color == COLOR_VALKEY else 1.5
                 ax.plot(scenarios, cv, marker='o', label=impl.replace('\n', ' '),
-                       linewidth=lw, color=color, alpha=0.8 if color == COLOR_PG else 1.0)
+                       linewidth=2.0, color=color, alpha=0.9)
 
             ax.set_ylabel('Throughput CV (%)', fontsize=10)
             ax.set_title('Throughput Variability (lower = more stable)', fontsize=12, fontweight='bold')
@@ -335,131 +412,262 @@ class GraphGenerator:
         print("Saved: scenario_comparison.png")
         plt.close()
 
-    def plot_valkey_vs_best_pg(self):
-        """Direct comparison: Valkey vs Best PostgreSQL implementation"""
-        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle('Valkey Streams vs Best PostgreSQL Queue: Direct Comparison\n'
-                     'Green = Valkey, Blue = Best PostgreSQL variant per scenario',
+    def plot_best_per_backend(self):
+        """Head-to-head: best variant of each backend, per scenario.
+
+        Picks the highest-throughput variant within each backend and
+        plots them side by side. Works with any subset of {pg, valkey,
+        kafka, rabbitmq} — only backends actually present in the data
+        show up.
+        """
+        backend_order = ['postgresql', 'valkey', 'kafka', 'rabbitmq']
+        backend_labels = {
+            'postgresql': 'PG', 'valkey': 'Valkey',
+            'kafka': 'Kafka', 'rabbitmq': 'RabbitMQ',
+        }
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle('Best Variant per Backend: Direct Comparison\n'
+                     'Each bar = highest-throughput variant of that backend in that scenario',
                      fontsize=12, fontweight='bold', y=1.02)
         scenarios = ['cold', 'warm', 'load']
 
         for idx, scenario in enumerate(scenarios):
             scenario_data = self.df[self.df['scenario'] == scenario]
-
-            if scenario_data.empty or len(scenario_data[scenario_data['backend'] == 'valkey']) == 0:
+            if scenario_data.empty:
                 continue
 
-            valkey_data = scenario_data[scenario_data['backend'] == 'valkey'].iloc[0]
-            pg_data = scenario_data[scenario_data['backend'] == 'postgresql'].sort_values(
-                self.tp_col, ascending=False)
-            if pg_data.empty:
-                continue
-            pg_data = pg_data.iloc[0]
+            # For each backend present, pick the row with the highest mean
+            # throughput. Missing backends are silently skipped.
+            best_rows = []
+            for backend in backend_order:
+                subset = scenario_data[scenario_data['backend'] == backend]
+                if subset.empty:
+                    continue
+                winner = subset.sort_values(self.tp_col, ascending=False).iloc[0]
+                best_rows.append((backend, winner))
 
-            # Throughput comparison
+            if not best_rows:
+                continue
+
+            # ---- Throughput subplot ----
             ax = axes[0, idx]
-            v_tp = valkey_data[self.tp_col]
-            p_tp = pg_data[self.tp_col]
-            bars = ax.bar(['Valkey\nStreams', f"PG\n({pg_data['queue_type']})"],
-                         [v_tp, p_tp],
-                         color=[COLOR_VALKEY, COLOR_PG], alpha=0.85)
+            labels = [f"{backend_labels[b]}\n({r['queue_type']})"
+                      for b, r in best_rows]
+            values = [r[self.tp_col] for _, r in best_rows]
+            colors = [BACKEND_COLORS[b] for b, _ in best_rows]
 
-            # Error bars if available
+            errs = None
             if self.tp_err_col and self.tp_err_col in self.df.columns:
-                v_err = valkey_data.get(self.tp_err_col, 0)
-                p_err = pg_data.get(self.tp_err_col, 0)
-                ax.errorbar([0, 1], [v_tp, p_tp], yerr=[v_err, p_err],
-                           fmt='none', capsize=5, color='black', linewidth=1.5)
+                errs = [r.get(self.tp_err_col, 0) for _, r in best_rows]
 
+            bars = ax.bar(range(len(labels)), values, color=colors, alpha=0.85,
+                          yerr=errs, capsize=4)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, fontsize=8)
             ax.set_ylabel('Throughput (jobs/sec)', fontsize=10)
             ax.set_title(f'{scenario.title()} - Throughput', fontsize=11, fontweight='bold')
             ax.grid(axis='y', alpha=0.3)
+            for bar, v in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 20,
+                        f'{v:.0f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
 
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2, height + 20,
-                       f'{height:.0f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-            # Percentage difference
-            if p_tp > 0:
-                diff_pct = (v_tp - p_tp) / p_tp * 100
-                ax.text(0.5, 0.02, f'Valkey {diff_pct:+.0f}%',
-                       transform=ax.transAxes, ha='center', fontsize=9,
-                       color=COLOR_VALKEY if diff_pct > 0 else 'red', fontweight='bold')
-
-            # Latency comparison
+            # ---- Latency subplot ----
             ax = axes[1, idx]
             x = np.arange(3)
-            width = 0.35
+            width = 0.8 / max(len(best_rows), 1)
 
-            v_lats = [valkey_data[self.lat_cols['p50']], valkey_data[self.lat_cols['p95']],
-                     valkey_data[self.lat_cols['p99']]]
-            p_lats = [pg_data[self.lat_cols['p50']], pg_data[self.lat_cols['p95']],
-                     pg_data[self.lat_cols['p99']]]
+            for i, (backend, row) in enumerate(best_rows):
+                lats = [row[self.lat_cols[p]] for p in ('p50', 'p95', 'p99')]
+                # Asymmetric bootstrap errors where available.
+                errs_2d = []
+                for p in ('p50', 'p95', 'p99'):
+                    lo_c = self.lat_cols.get(f'{p}_ci_lo')
+                    hi_c = self.lat_cols.get(f'{p}_ci_hi')
+                    sd_c = self.lat_cols.get(f'{p}_err')
+                    mean = row[self.lat_cols[p]]
+                    if (lo_c and hi_c and lo_c in row.index
+                            and not pd.isna(row.get(lo_c, np.nan))):
+                        errs_2d.append((max(0, mean - row[lo_c]),
+                                        max(0, row[hi_c] - mean)))
+                    elif sd_c and sd_c in row.index and not pd.isna(row.get(sd_c, np.nan)):
+                        errs_2d.append((row[sd_c], row[sd_c]))
+                    else:
+                        errs_2d.append((0, 0))
+                errs_2d = np.array(errs_2d).T
 
-            ax.bar(x - width/2, v_lats, width, label='Valkey', color=COLOR_VALKEY, alpha=0.85)
-            ax.bar(x + width/2, p_lats, width, label=f"PG ({pg_data['queue_type']})",
-                  color=COLOR_PG, alpha=0.85)
+                offset = (i - (len(best_rows) - 1) / 2) * width
+                ax.bar(x + offset, lats, width,
+                       label=f"{backend_labels[backend]} ({row['queue_type']})",
+                       color=BACKEND_COLORS[backend], alpha=0.85,
+                       yerr=errs_2d, capsize=3)
 
-            ax.set_ylabel('Latency (ms)', fontsize=10)
-            ax.set_title(f'{scenario.title()} - Latency', fontsize=11, fontweight='bold')
+            ax.set_ylabel('Latency (ms, log scale)', fontsize=10)
+            ax.set_yscale('log')
+            ax.set_title(f'{scenario.title()} - Latency (end-to-end)',
+                         fontsize=11, fontweight='bold')
             ax.set_xticks(x)
             ax.set_xticklabels(['p50', 'p95', 'p99'])
-            ax.legend(fontsize=8)
-            ax.grid(axis='y', alpha=0.3)
+            ax.legend(fontsize=7, loc='upper left')
+            ax.grid(axis='y', alpha=0.3, which='both')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'valkey_vs_best_pg.png'), dpi=300, bbox_inches='tight')
-        print("Saved: valkey_vs_best_pg.png")
+        plt.savefig(os.path.join(self.output_dir, 'best_per_backend.png'),
+                    dpi=300, bbox_inches='tight')
+        print("Saved: best_per_backend.png")
+        plt.close()
+
+    def plot_service_vs_e2e(self):
+        """Side-by-side service vs end-to-end latency (reviewer concern #1).
+
+        For each (scenario, percentile) cell, draw two bars per variant:
+          orange = end-to-end (enqueue -> ack, the user-visible number)
+          purple = service    (dequeue -> ack, the DB/broker's contribution)
+
+        The gap between the two bars is queue wait time. If the producer
+        is overdriven, e2e will tower over service and the chart makes
+        that visible without the reader having to do arithmetic.
+        """
+        if not self.has_service_latency:
+            print("Skipping: service_vs_e2e (no service_* columns; run with "
+                  "updated workers)")
+            return
+
+        fig, axes = plt.subplots(3, 3, figsize=(18, 13))
+        fig.suptitle('Service latency (dequeue->ack) vs End-to-end latency '
+                     '(enqueue->ack)\n'
+                     'Gap between bars = time spent waiting in queue. '
+                     'Large gap => arrival rate exceeds service rate.',
+                     fontsize=13, fontweight='bold', y=1.005)
+        scenarios = ['cold', 'warm', 'load']
+        percentiles = ['p50', 'p95', 'p99']
+
+        for row_idx, scenario in enumerate(scenarios):
+            for col_idx, pct in enumerate(percentiles):
+                ax = axes[row_idx, col_idx]
+                e2e_col = self.lat_cols[pct]
+                svc_col = self.lat_cols[f'service_{pct}']
+                data = self.df[self.df['scenario'] == scenario].sort_values(e2e_col)
+
+                if data.empty or svc_col not in data.columns:
+                    ax.axis('off')
+                    continue
+
+                y = np.arange(len(data))
+                h = 0.4
+
+                e2e_vals = data[e2e_col].values
+                svc_vals = data[svc_col].fillna(0).values
+
+                e2e_err = self._err_deltas(
+                    data, e2e_col,
+                    self.lat_cols.get(f'{pct}_ci_lo'),
+                    self.lat_cols.get(f'{pct}_ci_hi'),
+                    self.lat_cols.get(f'{pct}_err'),
+                )
+                svc_err = self._err_deltas(
+                    data, svc_col,
+                    self.lat_cols.get(f'service_{pct}_ci_lo'),
+                    self.lat_cols.get(f'service_{pct}_ci_hi'),
+                    self.lat_cols.get(f'service_{pct}_err'),
+                )
+
+                ax.barh(y + h / 2, e2e_vals, h, color=COLOR_E2E, alpha=0.85,
+                        label='End-to-end', xerr=e2e_err, capsize=3)
+                ax.barh(y - h / 2, svc_vals, h, color=COLOR_SERVICE, alpha=0.85,
+                        label='Service', xerr=svc_err, capsize=3)
+
+                ax.set_yticks(y)
+                ax.set_yticklabels(data['label'], fontsize=8)
+                ax.set_xlabel('Latency (ms, log scale)', fontsize=9)
+                ax.set_xscale('log')
+                ax.set_title(f'{scenario.title()} - {pct}', fontsize=10, fontweight='bold')
+                ax.grid(axis='x', alpha=0.3, which='both')
+
+                if row_idx == 0 and col_idx == 2:
+                    ax.legend(loc='lower right', fontsize=8)
+
+                # Annotate the largest queue-wait gap in each cell.
+                if len(data) > 0:
+                    gaps = e2e_vals - svc_vals
+                    if np.isfinite(gaps).any():
+                        worst = int(np.nanargmax(gaps))
+                        if gaps[worst] > svc_vals[worst] * 0.5 and svc_vals[worst] > 0:
+                            ratio = e2e_vals[worst] / max(svc_vals[worst], 0.001)
+                            ax.annotate(
+                                f'{ratio:.0f}x queue wait',
+                                xy=(e2e_vals[worst], worst + h / 2),
+                                xytext=(e2e_vals[worst] * 1.15, worst - 0.3),
+                                fontsize=7, color='black',
+                                arrowprops=dict(arrowstyle='->', color='black', lw=0.8))
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'service_vs_e2e_latency.png'),
+                    dpi=300, bbox_inches='tight')
+        print("Saved: service_vs_e2e_latency.png")
         plt.close()
 
     def plot_decision_guide(self):
-        """Visual decision guide: when to use PG vs Valkey"""
-        fig, ax = plt.subplots(figsize=(12, 7))
+        """Visual decision guide across 4 backends.
 
-        criteria = [
-            ('Throughput', '< 500 j/s', '> 500 j/s'),
-            ('Traffic Pattern', 'Stable', 'Bursty / Variable'),
-            ('p95/p99 SLA', 'Not Required', 'Required'),
-            ('Job Durability', 'Critical (financial)', 'Best-effort OK'),
-            ('Ops Overhead', 'Prefer fewer systems', 'Dedicated infra OK'),
-            ('Query Flexibility', 'Needed (filter/report)', 'Not needed'),
+        Each row = decision criterion. Each column = backend.
+        Cell text = which use-case that backend fits best under that criterion.
+        """
+        fig, ax = plt.subplots(figsize=(18, 8))
+
+        # Columns: (backend_key, display_name, color)
+        columns = [
+            ('postgresql', 'PostgreSQL Queue', COLOR_PG),
+            ('valkey',     'Valkey Streams',   COLOR_VALKEY),
+            ('kafka',      'Kafka',            COLOR_KAFKA),
+            ('rabbitmq',   'RabbitMQ',         COLOR_RABBITMQ),
         ]
 
-        ax.set_xlim(-0.5, 2.5)
-        ax.set_ylim(-0.5, len(criteria) - 0.5)
+        # Rows: (criterion, [value per column]) — order matches `columns` above
+        criteria = [
+            ('Throughput',         ['< 500 j/s',          '> 500 j/s, bursty',   '> 10k j/s',              '500 – 5k j/s']),
+            ('Traffic pattern',    ['Stable',             'Bursty / variable',   'Sustained high-rate',    'Mixed, short-lived jobs']),
+            ('p95/p99 SLA',        ['Not required',       'Required',            'Required (high-vol)',    'Moderate; quorum relaxes tails']),
+            ('Durability',         ['Critical (WAL)',     'Best-effort',         'Strong (replicated log)','Strong (quorum) / medium (classic)']),
+            ('Ops overhead',       ['Prefer fewer systems','Dedicated infra OK', 'Significant (ZK/KRaft)', 'Moderate (Erlang)']),
+            ('Replay / history',   ['Not supported',      'Limited (stream)',    'First-class',            'Not supported']),
+            ('Routing flexibility',['SQL filter only',    'None',                'Partition keys only',    'Exchanges, bindings, topics']),
+        ]
 
-        for i, (criterion, pg_val, valkey_val) in enumerate(criteria):
-            y = len(criteria) - 1 - i
+        n_rows = len(criteria)
+        n_cols = len(columns)
 
-            # Criterion label
-            ax.text(0, y, criterion, ha='center', va='center', fontsize=11, fontweight='bold')
+        ax.set_xlim(-0.5, n_cols + 0.5)
+        ax.set_ylim(-0.5, n_rows - 0.5 + 0.8)
 
-            # PG value
-            ax.add_patch(plt.Rectangle((0.6, y - 0.35), 0.8, 0.7,
-                                       facecolor=COLOR_PG, alpha=0.3, edgecolor=COLOR_PG))
-            ax.text(1.0, y, pg_val, ha='center', va='center', fontsize=9)
+        for i, (criterion, values) in enumerate(criteria):
+            y = n_rows - 1 - i
+            ax.text(0, y, criterion, ha='center', va='center',
+                    fontsize=10, fontweight='bold')
 
-            # Valkey value
-            ax.add_patch(plt.Rectangle((1.6, y - 0.35), 0.8, 0.7,
-                                       facecolor=COLOR_VALKEY, alpha=0.3, edgecolor=COLOR_VALKEY))
-            ax.text(2.0, y, valkey_val, ha='center', va='center', fontsize=9)
+            for j, ((key, _name, color), val) in enumerate(zip(columns, values)):
+                cx = j + 1
+                ax.add_patch(plt.Rectangle((cx - 0.45, y - 0.4), 0.9, 0.8,
+                                            facecolor=color, alpha=0.25,
+                                            edgecolor=color, linewidth=1.5))
+                ax.text(cx, y, val, ha='center', va='center', fontsize=8)
 
-        # Headers
-        ax.text(0, len(criteria) - 0.5 + 0.3, 'Criterion', ha='center', va='bottom',
-               fontsize=12, fontweight='bold')
-        ax.text(1.0, len(criteria) - 0.5 + 0.3, 'PostgreSQL Queue', ha='center', va='bottom',
-               fontsize=12, fontweight='bold', color=COLOR_PG_DARK)
-        ax.text(2.0, len(criteria) - 0.5 + 0.3, 'Valkey Streams', ha='center', va='bottom',
-               fontsize=12, fontweight='bold', color='#27ae60')
+        # Column headers
+        ax.text(0, n_rows - 0.5 + 0.5, 'Criterion', ha='center', va='bottom',
+                fontsize=11, fontweight='bold')
+        for j, (key, name, color) in enumerate(columns):
+            ax.text(j + 1, n_rows - 0.5 + 0.5, name, ha='center', va='bottom',
+                    fontsize=11, fontweight='bold', color=color)
 
-        ax.set_title('Decision Guide: PostgreSQL Queue vs Valkey Streams\n'
-                     'Choose the right tool based on your requirements',
-                     fontsize=14, fontweight='bold', pad=20)
+        ax.set_title(
+            'Decision Guide: choose the right queue for your workload\n'
+            '(single-node deployment — cluster deployments shift the tradeoffs)',
+            fontsize=13, fontweight='bold', pad=20)
         ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'decision_guide.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(self.output_dir, 'decision_guide.png'),
+                    dpi=300, bbox_inches='tight')
         print("Saved: decision_guide.png")
         plt.close()
 
@@ -470,10 +678,11 @@ class GraphGenerator:
 
         self.plot_throughput_comparison()
         self.plot_latency_comparison()
+        self.plot_service_vs_e2e()
         self.plot_latency_distribution()
         self.plot_cpu_usage()
         self.plot_scenario_comparison()
-        self.plot_valkey_vs_best_pg()
+        self.plot_best_per_backend()
         self.plot_decision_guide()
 
         print("-" * 50)

@@ -99,6 +99,7 @@ echo ""
 echo ">>> Initializing database schemas..."
 cd schema/
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_basic.sql
+PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_basic_batch.sql
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_delete_returning.sql
 PGPASSWORD=bench_pass psql -h localhost -U bench_user -d bench_db -f pg_queue_partitioned.sql
 PGPASSWORD=bench_pass pgbench -h localhost -U bench_user -d bench_db -i -s 10 2>/dev/null

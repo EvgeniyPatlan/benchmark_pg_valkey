@@ -1,0 +1,11 @@
+{
+  "_comment": "Measured sustained service rate per backend:queue_type, in jobs/sec. Populate from an uncapped shakedown run. Consumed by producer.py --auto-cap to hold arrival rate at 90% of these values (reviewer concern #1).",
+  "pg:skip_locked": null,
+  "pg:skip_locked_batch": null,
+  "pg:delete_returning": null,
+  "pg:partitioned": null,
+  "valkey:streams": null,
+  "kafka:standard": null,
+  "rabbitmq:classic": null,
+  "rabbitmq:quorum": null
+}

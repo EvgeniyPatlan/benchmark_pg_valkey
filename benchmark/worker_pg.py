@@ -27,35 +27,44 @@ from config import BENCHMARK, DB_CONFIG, QUEUE_TYPES
 
 
 class MetricsCollector:
-    """Tracks two latency distributions per run.
+    """Tracks three latency distributions per run.
 
-    e2e_ms     : enqueue_ts -> ack_ts. Reflects user-visible latency but is
-                 dominated by queue wait time when arrival > service rate.
-    service_ms : dequeue_ts -> ack_ts. Reflects the database's processing
-                 time and is the fair number to compare across backends when
-                 the arrival rate is held below service capacity.
+    e2e_ms     : enqueue_ts -> ack_ts. User-visible; dominated by queue
+                 wait time when arrival > service rate.
+    service_ms : batch-dequeue_ts -> per-message-ack_ts. Current-definition
+                 "service" latency. Kept for continuity, but NOTE this
+                 penalizes batched backends by batch position: message N
+                 in a batch of 50 carries 49 × processing_time of prior
+                 messages' work before its own ack.
+    broker_ms  : (total batch cycle time − N × processing_time) / N.
+                 Time the broker/transport contributed per message,
+                 excluding simulated work. This is the fair infrastructure
+                 metric — does NOT penalize batching.
     """
     def __init__(self, output_file):
         self.output_file = output_file
         self.jobs_processed = 0
         self.latencies_e2e = []
         self.latencies_service = []
+        self.latencies_broker = []
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
 
-    def record_job(self, e2e_ms, service_ms):
+    def record_job(self, e2e_ms, service_ms, broker_ms):
         with self.lock:
             self.jobs_processed += 1
             self.latencies_e2e.append(e2e_ms)
             self.latencies_service.append(service_ms)
+            self.latencies_broker.append(broker_ms)
 
-    def record_jobs(self, pairs):
-        """Record multiple (e2e_ms, service_ms) pairs at once (batched)."""
+    def record_jobs(self, triples):
+        """Record multiple (e2e_ms, service_ms, broker_ms) triples."""
         with self.lock:
-            self.jobs_processed += len(pairs)
-            for e2e, svc in pairs:
+            self.jobs_processed += len(triples)
+            for e2e, svc, brk in triples:
                 self.latencies_e2e.append(e2e)
                 self.latencies_service.append(svc)
+                self.latencies_broker.append(brk)
 
     @staticmethod
     def _percentile(sorted_vals, p):
@@ -71,6 +80,7 @@ class MetricsCollector:
 
             e2e_sorted = sorted(self.latencies_e2e)
             svc_sorted = sorted(self.latencies_service)
+            brk_sorted = sorted(self.latencies_broker)
             elapsed = time.time() - self.start_time
 
             return {
@@ -78,25 +88,30 @@ class MetricsCollector:
                 'elapsed': elapsed,
                 'jobs_processed': self.jobs_processed,
                 'throughput': self.jobs_processed / elapsed if elapsed > 0 else 0,
-                # End-to-end (enqueue -> ack). Backward-compatible names so
-                # existing analyze.py/generate_graphs.py keep working.
+                # End-to-end (enqueue -> ack). Backward-compatible names.
                 'latency_p50': self._percentile(e2e_sorted, 0.50),
                 'latency_p95': self._percentile(e2e_sorted, 0.95),
                 'latency_p99': self._percentile(e2e_sorted, 0.99),
                 'latency_min': e2e_sorted[0],
                 'latency_max': e2e_sorted[-1],
                 'latency_avg': sum(e2e_sorted) / len(e2e_sorted),
-                # Explicit e2e copy (so future readers can tell which is which).
                 'e2e_p50': self._percentile(e2e_sorted, 0.50),
                 'e2e_p95': self._percentile(e2e_sorted, 0.95),
                 'e2e_p99': self._percentile(e2e_sorted, 0.99),
-                # Service latency (dequeue -> ack). The fair database metric.
+                # Service (batch-dequeue -> per-message-ack). Penalizes batching.
                 'service_p50': self._percentile(svc_sorted, 0.50),
                 'service_p95': self._percentile(svc_sorted, 0.95),
                 'service_p99': self._percentile(svc_sorted, 0.99),
                 'service_min': svc_sorted[0],
                 'service_max': svc_sorted[-1],
                 'service_avg': sum(svc_sorted) / len(svc_sorted),
+                # Broker overhead per message — the fair infrastructure metric.
+                'broker_p50': self._percentile(brk_sorted, 0.50),
+                'broker_p95': self._percentile(brk_sorted, 0.95),
+                'broker_p99': self._percentile(brk_sorted, 0.99),
+                'broker_min': brk_sorted[0],
+                'broker_max': brk_sorted[-1],
+                'broker_avg': sum(brk_sorted) / len(brk_sorted),
             }
 
     def save_metrics(self):
@@ -143,6 +158,7 @@ class PostgreSQLWorker:
     def process_job_basic(self):
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
         try:
+            cycle_start = time.monotonic()
             cursor.execute(
                 f"SELECT * FROM {self.config['get_function']}(%s)",
                 (self.worker_id,)
@@ -165,9 +181,15 @@ class PostgreSQLWorker:
             )
 
             ack_ts = datetime.now()
+            cycle_end = time.monotonic()
+
             e2e_ms = (ack_ts - created_at).total_seconds() * 1000
             service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-            self.metrics.record_job(e2e_ms, service_ms)
+            # Broker overhead = cycle - processing. Single-row: N=1.
+            broker_ms = ((cycle_end - cycle_start) * 1000
+                         - BENCHMARK['job_processing_time_ms'])
+            broker_ms = max(0.0, broker_ms)
+            self.metrics.record_job(e2e_ms, service_ms, broker_ms)
             self.jobs_processed += 1
             return True
         except Exception as e:
@@ -177,6 +199,7 @@ class PostgreSQLWorker:
     def process_job_delete_returning(self):
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
         try:
+            cycle_start = time.monotonic()
             cursor.execute(
                 f"SELECT * FROM {self.config['get_function']}(%s)",
                 (self.worker_id,)
@@ -201,9 +224,12 @@ class PostgreSQLWorker:
             )
 
             ack_ts = datetime.now()
+            cycle_end = time.monotonic()
             e2e_ms = (ack_ts - created_at).total_seconds() * 1000
             service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-            self.metrics.record_job(e2e_ms, service_ms)
+            broker_ms = max(0.0, (cycle_end - cycle_start) * 1000
+                            - BENCHMARK['job_processing_time_ms'])
+            self.metrics.record_job(e2e_ms, service_ms, broker_ms)
             self.jobs_processed += 1
             return True
         except Exception as e:
@@ -214,6 +240,7 @@ class PostgreSQLWorker:
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
         for partition_key in self.partitions:
             try:
+                cycle_start = time.monotonic()
                 cursor.execute(
                     f"SELECT * FROM {self.config['get_function']}(%s, %s)",
                     (partition_key, self.worker_id)
@@ -234,9 +261,12 @@ class PostgreSQLWorker:
                 )
 
                 ack_ts = datetime.now()
+                cycle_end = time.monotonic()
                 e2e_ms = (ack_ts - created_at).total_seconds() * 1000
                 service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-                self.metrics.record_job(e2e_ms, service_ms)
+                broker_ms = max(0.0, (cycle_end - cycle_start) * 1000
+                                - BENCHMARK['job_processing_time_ms'])
+                self.metrics.record_job(e2e_ms, service_ms, broker_ms)
                 self.jobs_processed += 1
                 return True
             except Exception as e:
@@ -250,13 +280,15 @@ class PostgreSQLWorker:
         """SKIP LOCKED with LIMIT N (reviewer concern #3).
 
         Fetches up to pg_batch_worker_batch_size rows in one transaction,
-        processes them, then bulk-completes in one UPDATE. Service latency
-        is measured per-row (dequeue_ts is the common fetch timestamp for
-        the batch, ack_ts is per-row after simulated work).
+        processes them, then bulk-completes in one UPDATE. Three latencies
+        per row (see MetricsCollector docstring): e2e, service (penalizes
+        batching by position), broker (amortized batch-cycle cost
+        excluding processing — fair).
         """
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
         batch_size = BENCHMARK['pg_batch_worker_batch_size']
         try:
+            cycle_start = time.monotonic()
             cursor.execute(
                 f"SELECT * FROM {self.config['get_function']}(%s, %s)",
                 (self.worker_id, batch_size)
@@ -268,26 +300,32 @@ class PostgreSQLWorker:
 
             dequeue_ts = datetime.now()
 
-            # Simulate per-job work sequentially. Using one sleep for the
-            # whole batch would artificially help the batched variant; we
-            # want realistic per-job CPU/IO time.
-            pairs = []
+            # Collect (e2e_ms, service_ms) per row first; broker_ms is
+            # computed after the ack call lands, then broadcast to all rows.
+            e2e_svc = []
             for job in rows:
                 self.simulate_processing()
                 ack_ts = datetime.now()
                 e2e_ms = (ack_ts - job['job_created_at']).total_seconds() * 1000
                 service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-                pairs.append((e2e_ms, service_ms))
+                e2e_svc.append((e2e_ms, service_ms))
 
-            # Bulk-complete in one statement.
             job_ids = [row['job_id'] for row in rows]
             cursor.execute(
                 f"SELECT {self.config['complete_function']}(%s::bigint[])",
                 (job_ids,)
             )
+            cycle_end = time.monotonic()
 
-            self.metrics.record_jobs(pairs)
-            self.jobs_processed += len(rows)
+            # Broker overhead per message, amortized across the batch.
+            n = len(rows)
+            total_ms = (cycle_end - cycle_start) * 1000
+            proc_ms = n * BENCHMARK['job_processing_time_ms']
+            broker_ms_per = max(0.0, (total_ms - proc_ms) / n)
+
+            triples = [(e2e, svc, broker_ms_per) for (e2e, svc) in e2e_svc]
+            self.metrics.record_jobs(triples)
+            self.jobs_processed += n
             return True
         except Exception as e:
             print(f"[{self.worker_id}] Error processing batch: {e}")

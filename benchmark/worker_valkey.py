@@ -19,25 +19,35 @@ from config import BENCHMARK, VALKEY_CONFIG, get_stream_keys
 
 
 class MetricsCollector:
+    """Three latency distributions per run. See worker_pg.py docstring for
+    full definitions; summary:
+      e2e_ms     = enqueue -> ack
+      service_ms = batch-dequeue -> per-message ack (penalizes batching)
+      broker_ms  = (cycle - N × processing) / N (fair broker overhead)
+    """
     def __init__(self, output_file):
         self.output_file = output_file
         self.jobs_processed = 0
         self.latencies_e2e = []
         self.latencies_service = []
+        self.latencies_broker = []
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
         self._window_e2e = []
         self._window_service = []
+        self._window_broker = []
 
-    def record_jobs(self, pairs):
-        """pairs: list of (e2e_ms, service_ms) tuples."""
+    def record_jobs(self, triples):
+        """triples: list of (e2e_ms, service_ms, broker_ms) tuples."""
         with self.lock:
-            self.jobs_processed += len(pairs)
-            for e2e, svc in pairs:
+            self.jobs_processed += len(triples)
+            for e2e, svc, brk in triples:
                 self.latencies_e2e.append(e2e)
                 self.latencies_service.append(svc)
+                self.latencies_broker.append(brk)
                 self._window_e2e.append(e2e)
                 self._window_service.append(svc)
+                self._window_broker.append(brk)
 
     @staticmethod
     def _p(sorted_vals, pct):
@@ -53,8 +63,10 @@ class MetricsCollector:
 
             e2e_sorted = sorted(self.latencies_e2e)
             svc_sorted = sorted(self.latencies_service)
-            wsvc_sorted = sorted(self._window_service) if self._window_service else svc_sorted
+            brk_sorted = sorted(self.latencies_broker)
             we2e_sorted = sorted(self._window_e2e) if self._window_e2e else e2e_sorted
+            wsvc_sorted = sorted(self._window_service) if self._window_service else svc_sorted
+            wbrk_sorted = sorted(self._window_broker) if self._window_broker else brk_sorted
             elapsed = time.time() - self.start_time
 
             metrics = {
@@ -62,36 +74,42 @@ class MetricsCollector:
                 'elapsed': elapsed,
                 'jobs_processed': self.jobs_processed,
                 'throughput': self.jobs_processed / elapsed if elapsed > 0 else 0,
-                # Backward-compatible names = end-to-end.
                 'latency_p50': self._p(e2e_sorted, 0.50),
                 'latency_p95': self._p(e2e_sorted, 0.95),
                 'latency_p99': self._p(e2e_sorted, 0.99),
                 'latency_min': e2e_sorted[0],
                 'latency_max': e2e_sorted[-1],
                 'latency_avg': sum(e2e_sorted) / len(e2e_sorted),
-                # Explicit e2e.
                 'e2e_p50': self._p(e2e_sorted, 0.50),
                 'e2e_p95': self._p(e2e_sorted, 0.95),
                 'e2e_p99': self._p(e2e_sorted, 0.99),
-                # Service latency.
                 'service_p50': self._p(svc_sorted, 0.50),
                 'service_p95': self._p(svc_sorted, 0.95),
                 'service_p99': self._p(svc_sorted, 0.99),
                 'service_min': svc_sorted[0],
                 'service_max': svc_sorted[-1],
                 'service_avg': sum(svc_sorted) / len(svc_sorted),
-                # Window (since last snapshot) for time-series plots.
+                'broker_p50': self._p(brk_sorted, 0.50),
+                'broker_p95': self._p(brk_sorted, 0.95),
+                'broker_p99': self._p(brk_sorted, 0.99),
+                'broker_min': brk_sorted[0],
+                'broker_max': brk_sorted[-1],
+                'broker_avg': sum(brk_sorted) / len(brk_sorted),
                 'window_e2e_p50': self._p(we2e_sorted, 0.50),
                 'window_e2e_p95': self._p(we2e_sorted, 0.95),
                 'window_e2e_p99': self._p(we2e_sorted, 0.99),
                 'window_service_p50': self._p(wsvc_sorted, 0.50),
                 'window_service_p95': self._p(wsvc_sorted, 0.95),
                 'window_service_p99': self._p(wsvc_sorted, 0.99),
+                'window_broker_p50': self._p(wbrk_sorted, 0.50),
+                'window_broker_p95': self._p(wbrk_sorted, 0.95),
+                'window_broker_p99': self._p(wbrk_sorted, 0.99),
                 'window_size': len(we2e_sorted),
             }
 
             self._window_e2e = []
             self._window_service = []
+            self._window_broker = []
             return metrics
 
     def save_metrics(self):
@@ -141,6 +159,7 @@ class ValkeyWorker:
     def process_messages(self):
         try:
             streams_dict = {key: '>' for key in self.stream_keys}
+            cycle_start = time.monotonic()
             messages = self.valkey.xreadgroup(
                 groupname=self.consumer_group,
                 consumername=self.worker_id,
@@ -152,12 +171,9 @@ class ValkeyWorker:
             if not messages:
                 return 0
 
-            # Dequeue timestamp is the moment XREADGROUP returned; service
-            # latency measures from there to each per-message ack.
             dequeue_ts = datetime.now()
-
             ack_by_stream = {}
-            pairs = []
+            e2e_svc = []
 
             for stream_name, stream_messages in messages:
                 stream_name_str = stream_name.decode('utf-8') if isinstance(stream_name, bytes) else stream_name
@@ -172,7 +188,7 @@ class ValkeyWorker:
                         ack_ts = datetime.now()
                         e2e_ms = (ack_ts - created_at).total_seconds() * 1000
                         service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-                        pairs.append((e2e_ms, service_ms))
+                        e2e_svc.append((e2e_ms, service_ms))
 
                         ack_by_stream.setdefault(stream_name_str, []).append(message_id)
                         self.jobs_processed += 1
@@ -186,8 +202,14 @@ class ValkeyWorker:
                 except Exception as e:
                     print(f"[{self.worker_id}] Error acking on {stream_key}: {e}")
 
-            if pairs:
-                self.metrics.record_jobs(pairs)
+            cycle_end = time.monotonic()
+            n = len(e2e_svc)
+            if n > 0:
+                total_ms = (cycle_end - cycle_start) * 1000
+                proc_ms = n * BENCHMARK['job_processing_time_ms']
+                broker_ms_per = max(0.0, (total_ms - proc_ms) / n)
+                triples = [(e2e, svc, broker_ms_per) for (e2e, svc) in e2e_svc]
+                self.metrics.record_jobs(triples)
 
             return sum(len(ids) for ids in ack_by_stream.values())
 
@@ -219,7 +241,8 @@ class ValkeyWorker:
                     continue
 
                 claimed_ids = []
-                pairs = []
+                e2e_svc = []
+                cycle_start = time.monotonic()
 
                 for msg in pending:
                     message_id = msg['message_id']
@@ -246,7 +269,7 @@ class ValkeyWorker:
                                     ack_ts = datetime.now()
                                     e2e_ms = (ack_ts - created_at).total_seconds() * 1000
                                     service_ms = (ack_ts - claim_ts).total_seconds() * 1000
-                                    pairs.append((e2e_ms, service_ms))
+                                    e2e_svc.append((e2e_ms, service_ms))
                                     claimed_ids.append(msg_id)
                                     self.jobs_processed += 1
                         except Exception as e:
@@ -259,8 +282,14 @@ class ValkeyWorker:
                     except Exception as e:
                         print(f"[{self.worker_id}] Error acking claimed: {e}")
 
-                if pairs:
-                    self.metrics.record_jobs(pairs)
+                cycle_end = time.monotonic()
+                n = len(e2e_svc)
+                if n > 0:
+                    total_ms = (cycle_end - cycle_start) * 1000
+                    proc_ms = n * BENCHMARK['job_processing_time_ms']
+                    broker_ms_per = max(0.0, (total_ms - proc_ms) / n)
+                    triples = [(e2e, svc, broker_ms_per) for (e2e, svc) in e2e_svc]
+                    self.metrics.record_jobs(triples)
 
                 total_claimed += len(claimed_ids)
             except Exception as e:

@@ -28,14 +28,16 @@ class MetricsCollector:
         self.jobs_processed = 0
         self.latencies_e2e = []
         self.latencies_service = []
+        self.latencies_broker = []
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
 
-    def record_job(self, e2e_ms, service_ms):
+    def record_job(self, e2e_ms, service_ms, broker_ms):
         with self.lock:
             self.jobs_processed += 1
             self.latencies_e2e.append(e2e_ms)
             self.latencies_service.append(service_ms)
+            self.latencies_broker.append(broker_ms)
 
     @staticmethod
     def _p(sorted_vals, pct):
@@ -50,6 +52,7 @@ class MetricsCollector:
                 return None
             e2e = sorted(self.latencies_e2e)
             svc = sorted(self.latencies_service)
+            brk = sorted(self.latencies_broker)
             elapsed = time.time() - self.start_time
             return {
                 'timestamp': datetime.now().isoformat(),
@@ -69,6 +72,11 @@ class MetricsCollector:
                 'service_p99': self._p(svc, 0.99),
                 'service_min': svc[0], 'service_max': svc[-1],
                 'service_avg': sum(svc) / len(svc),
+                'broker_p50': self._p(brk, 0.50),
+                'broker_p95': self._p(brk, 0.95),
+                'broker_p99': self._p(brk, 0.99),
+                'broker_min': brk[0], 'broker_max': brk[-1],
+                'broker_avg': sum(brk) / len(brk),
             }
 
     def save_metrics(self):
@@ -118,9 +126,10 @@ class RabbitMQWorker:
             time.sleep(ms / 1000.0)
 
     def _on_message(self, ch, method, properties, body):
-        """Per-message callback. pika dispatches one at a time even with
-        prefetch>1 (prefetch is about flow control, not batching), so we
-        measure service latency as delivery-time → ack-time."""
+        """Per-message callback. pika dispatches one at a time (prefetch is
+        flow control, not batching), so N=1 per cycle and
+        broker_ms = total_cycle - processing_time."""
+        cycle_start = time.monotonic()
         dequeue_ts = datetime.now()
         try:
             created_at = datetime.now()
@@ -133,13 +142,17 @@ class RabbitMQWorker:
                         pass
 
             self.simulate_processing()
-            ack_ts = datetime.now()
 
+            ack_start = time.monotonic()
             ch.basic_ack(delivery_tag=method.delivery_tag)
+            ack_ts = datetime.now()
+            cycle_end = time.monotonic()
 
             e2e_ms = (ack_ts - created_at).total_seconds() * 1000
             service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-            self.metrics.record_job(e2e_ms, service_ms)
+            broker_ms = max(0.0, (cycle_end - cycle_start) * 1000
+                            - BENCHMARK['job_processing_time_ms'])
+            self.metrics.record_job(e2e_ms, service_ms, broker_ms)
             self.jobs_processed += 1
         except Exception as e:
             print(f"[{self.worker_id}] Error processing: {e}")

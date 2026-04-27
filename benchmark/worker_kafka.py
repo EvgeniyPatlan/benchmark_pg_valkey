@@ -26,15 +26,17 @@ class MetricsCollector:
         self.jobs_processed = 0
         self.latencies_e2e = []
         self.latencies_service = []
+        self.latencies_broker = []
         self.start_time = time.time()
         self.lock = __import__('threading').Lock()
 
-    def record_jobs(self, pairs):
+    def record_jobs(self, triples):
         with self.lock:
-            self.jobs_processed += len(pairs)
-            for e2e, svc in pairs:
+            self.jobs_processed += len(triples)
+            for e2e, svc, brk in triples:
                 self.latencies_e2e.append(e2e)
                 self.latencies_service.append(svc)
+                self.latencies_broker.append(brk)
 
     @staticmethod
     def _p(sorted_vals, pct):
@@ -49,6 +51,7 @@ class MetricsCollector:
                 return None
             e2e = sorted(self.latencies_e2e)
             svc = sorted(self.latencies_service)
+            brk = sorted(self.latencies_broker)
             elapsed = time.time() - self.start_time
             return {
                 'timestamp': datetime.now().isoformat(),
@@ -68,6 +71,11 @@ class MetricsCollector:
                 'service_p99': self._p(svc, 0.99),
                 'service_min': svc[0], 'service_max': svc[-1],
                 'service_avg': sum(svc) / len(svc),
+                'broker_p50': self._p(brk, 0.50),
+                'broker_p95': self._p(brk, 0.95),
+                'broker_p99': self._p(brk, 0.99),
+                'broker_min': brk[0], 'broker_max': brk[-1],
+                'broker_avg': sum(brk) / len(brk),
             }
 
     def save_metrics(self):
@@ -112,11 +120,8 @@ class KafkaWorker:
             time.sleep(ms / 1000.0)
 
     def poll_batch(self):
-        """Pull up to batch_size messages with a single-shot poll loop.
-
-        confluent-kafka's consume() API is the closest match to Valkey's
-        XREADGROUP COUNT=N — gets up to N messages in one round trip.
-        """
+        """Pull up to batch_size messages with a single-shot poll loop."""
+        cycle_start = time.monotonic()
         try:
             msgs = self.consumer.consume(num_messages=self.batch_size,
                                          timeout=self.poll_timeout_s)
@@ -127,7 +132,6 @@ class KafkaWorker:
         if not msgs:
             return 0
 
-        # Filter out errors; leave real messages.
         real_msgs = []
         for m in msgs:
             if m.error():
@@ -139,7 +143,7 @@ class KafkaWorker:
             return 0
 
         dequeue_ts = datetime.now()
-        pairs = []
+        e2e_svc = []
 
         for m in real_msgs:
             try:
@@ -148,21 +152,25 @@ class KafkaWorker:
                 ack_ts = datetime.now()
                 e2e_ms = (ack_ts - created_at).total_seconds() * 1000
                 service_ms = (ack_ts - dequeue_ts).total_seconds() * 1000
-                pairs.append((e2e_ms, service_ms))
+                e2e_svc.append((e2e_ms, service_ms))
                 self.jobs_processed += 1
             except Exception as e:
                 print(f"[{self.worker_id}] Error processing msg: {e}")
 
-        # Commit offsets for all consumed partitions in one round trip.
-        # This is the Kafka equivalent of 'ack the whole batch'.
         try:
             self.consumer.commit(asynchronous=False)
         except KafkaException as e:
             print(f"[{self.worker_id}] Commit error: {e}")
 
-        if pairs:
-            self.metrics.record_jobs(pairs)
-        return len(pairs)
+        cycle_end = time.monotonic()
+        n = len(e2e_svc)
+        if n > 0:
+            total_ms = (cycle_end - cycle_start) * 1000
+            proc_ms = n * BENCHMARK['job_processing_time_ms']
+            broker_ms_per = max(0.0, (total_ms - proc_ms) / n)
+            triples = [(e2e, svc, broker_ms_per) for (e2e, svc) in e2e_svc]
+            self.metrics.record_jobs(triples)
+        return n
 
     @staticmethod
     def _extract_created_at(msg):

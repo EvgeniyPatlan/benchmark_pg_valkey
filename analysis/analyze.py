@@ -107,6 +107,11 @@ class BenchmarkAnalyzer:
             'service_p95_ms': _last('service_p95', float('nan')) if 'service_p95' in df.columns else float('nan'),
             'service_p99_ms': _last('service_p99', float('nan')) if 'service_p99' in df.columns else float('nan'),
             'service_avg_ms': _last('service_avg', float('nan')) if 'service_avg' in df.columns else float('nan'),
+            # Broker overhead per message. NaN for pre-broker-metric runs.
+            'broker_p50_ms': _last('broker_p50', float('nan')) if 'broker_p50' in df.columns else float('nan'),
+            'broker_p95_ms': _last('broker_p95', float('nan')) if 'broker_p95' in df.columns else float('nan'),
+            'broker_p99_ms': _last('broker_p99', float('nan')) if 'broker_p99' in df.columns else float('nan'),
+            'broker_avg_ms': _last('broker_avg', float('nan')) if 'broker_avg' in df.columns else float('nan'),
         }
 
         # Load system metrics if available
@@ -304,6 +309,8 @@ class BenchmarkAnalyzer:
             'latency_avg_ms', 'latency_max_ms',
             'service_p50_ms', 'service_p95_ms', 'service_p99_ms',
             'service_avg_ms',
+            'broker_p50_ms', 'broker_p95_ms', 'broker_p99_ms',
+            'broker_avg_ms',
             'total_jobs',
         ]
 
@@ -313,6 +320,7 @@ class BenchmarkAnalyzer:
         percentile_cols = {
             'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
             'service_p50_ms', 'service_p95_ms', 'service_p99_ms',
+            'broker_p50_ms', 'broker_p95_ms', 'broker_p99_ms',
         }
 
         agg_rows = []
@@ -389,8 +397,11 @@ class BenchmarkAnalyzer:
             print('─' * 120)
 
             print(f"\n{'Backend':<12} {'Queue Type':<18} {'Runs':<6} "
-                  f"{'Throughput (j/s)':<22} {'p50 (ms)':<18} "
-                  f"{'p95 (ms)':<18} {'p99 (ms)':<18} {'CPU %':<12}")
+                  f"{'Throughput (j/s)':<20} "
+                  f"{'e2e p95 (ms)':<16} "
+                  f"{'service p95':<14} "
+                  f"{'broker p95':<14} "
+                  f"{'CPU %':<8}")
             print('─' * 120)
 
             for _, row in scenario_data.iterrows():
@@ -403,31 +414,22 @@ class BenchmarkAnalyzer:
                 if tp_sd > 0:
                     tp += f" +/-{tp_sd:.0f}"
 
-                p50 = f"{row.get('latency_p50_ms_mean', 0):.1f}"
-                p50_sd = row.get('latency_p50_ms_stddev', 0)
-                if p50_sd > 0:
-                    p50 += f" +/-{p50_sd:.1f}"
-
-                p95 = f"{row.get('latency_p95_ms_mean', 0):.1f}"
-                p95_sd = row.get('latency_p95_ms_stddev', 0)
-                if p95_sd > 0:
-                    p95 += f" +/-{p95_sd:.1f}"
-
-                p99 = f"{row.get('latency_p99_ms_mean', 0):.1f}"
-                p99_sd = row.get('latency_p99_ms_stddev', 0)
-                if p99_sd > 0:
-                    p99 += f" +/-{p99_sd:.1f}"
+                e2e_p95 = f"{row.get('latency_p95_ms_mean', 0):.1f}"
+                svc_p95_mean = row.get('service_p95_ms_mean', float('nan'))
+                svc_p95 = f"{svc_p95_mean:.1f}" if svc_p95_mean == svc_p95_mean else "N/A"
+                brk_p95_mean = row.get('broker_p95_ms_mean', float('nan'))
+                brk_p95 = f"{brk_p95_mean:.2f}" if brk_p95_mean == brk_p95_mean else "N/A"
 
                 cpu_mean = row.get('avg_cpu_user_mean', 0)
                 cpu = f"{cpu_mean:.1f}" if cpu_mean else "N/A"
 
                 print(f"{backend:<12} {queue_type:<18} {num_runs:<6} "
-                      f"{tp:<22} {p50:<18} {p95:<18} {p99:<18} {cpu:<12}")
+                      f"{tp:<20} {e2e_p95:<16} {svc_p95:<14} {brk_p95:<14} {cpu:<8}")
 
         print("\n" + "=" * 120)
 
-        # Exact percentile table
-        print("\nEXACT PERCENTILE VALUES (mean across runs):")
+        # Exact percentile table — end-to-end latency
+        print("\nEXACT END-TO-END PERCENTILES (enqueue -> ack, mean across runs):")
         print("=" * 120)
         print(f"{'Backend':<12} {'Queue':<18} {'Scenario':<8} "
               f"{'p50':<12} {'p95':<12} {'p99':<12} {'avg':<12} {'max':<12}")
@@ -440,6 +442,26 @@ class BenchmarkAnalyzer:
                   f"{row.get('latency_p99_ms_mean', 0):<12.2f} "
                   f"{row.get('latency_avg_ms_mean', 0):<12.2f} "
                   f"{row.get('latency_max_ms_mean', 0):<12.2f}")
+        print("=" * 120)
+
+        # Broker overhead table — the fair infrastructure metric
+        print("\nEXACT BROKER OVERHEAD PER MESSAGE (mean across runs):")
+        print("  = (batch_cycle_time - N × processing_time) / N")
+        print("  Fair across batch sizes. Lower is better.")
+        print("=" * 120)
+        print(f"{'Backend':<12} {'Queue':<18} {'Scenario':<8} "
+              f"{'p50 (ms)':<12} {'p95 (ms)':<12} {'p99 (ms)':<12} {'avg':<12}")
+        print('─' * 120)
+
+        for _, row in df.iterrows():
+            b50 = row.get('broker_p50_ms_mean', float('nan'))
+            if b50 != b50:  # NaN check
+                continue
+            print(f"{row['backend']:<12} {row['queue_type']:<18} {row['scenario']:<8} "
+                  f"{row.get('broker_p50_ms_mean', 0):<12.3f} "
+                  f"{row.get('broker_p95_ms_mean', 0):<12.3f} "
+                  f"{row.get('broker_p99_ms_mean', 0):<12.3f} "
+                  f"{row.get('broker_avg_ms_mean', 0):<12.3f}")
         print("=" * 120)
 
     def _print_legacy_summary(self):

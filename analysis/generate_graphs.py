@@ -33,7 +33,8 @@ COLOR_PG_DARK = '#2980b9'
 COLOR_KAFKA = '#e74c3c'       # red family for Kafka
 COLOR_RABBITMQ = '#f39c12'    # orange family for RabbitMQ (broker tradition)
 COLOR_SERVICE = '#9b59b6'     # service latency bars (dequeue -> ack)
-COLOR_E2E = '#16a085'         # end-to-end latency bars (distinct from RabbitMQ orange)
+COLOR_E2E = '#16a085'         # end-to-end latency bars
+COLOR_BROKER = '#f1c40f'      # broker overhead bars (fair infra metric)
 
 BACKEND_COLORS = {
     'postgresql': COLOR_PG,
@@ -84,6 +85,11 @@ class GraphGenerator:
                 self.lat_cols[f'service_{p}_err'] = f'service_{p}_ms_stddev'
                 self.lat_cols[f'service_{p}_ci_lo'] = f'service_{p}_ms_ci95_bootstrap_lo'
                 self.lat_cols[f'service_{p}_ci_hi'] = f'service_{p}_ms_ci95_bootstrap_hi'
+                # Broker overhead — NEW (may be missing in pre-broker-metric runs).
+                self.lat_cols[f'broker_{p}'] = f'broker_{p}_ms_mean'
+                self.lat_cols[f'broker_{p}_err'] = f'broker_{p}_ms_stddev'
+                self.lat_cols[f'broker_{p}_ci_lo'] = f'broker_{p}_ms_ci95_bootstrap_lo'
+                self.lat_cols[f'broker_{p}_ci_hi'] = f'broker_{p}_ms_ci95_bootstrap_hi'
             else:
                 self.lat_cols[p] = f'latency_{p}_ms'
                 self.lat_cols[f'{p}_err'] = None
@@ -91,6 +97,8 @@ class GraphGenerator:
                 self.lat_cols[f'{p}_ci_hi'] = None
                 self.lat_cols[f'service_{p}'] = f'service_{p}_ms'
                 self.lat_cols[f'service_{p}_err'] = None
+                self.lat_cols[f'broker_{p}'] = f'broker_{p}_ms'
+                self.lat_cols[f'broker_{p}_err'] = None
 
         # True if this run has service latency columns (i.e., post-reviewer
         # worker changes). Drives whether plot_service_vs_e2e runs.
@@ -98,6 +106,14 @@ class GraphGenerator:
             self.is_aggregated
             and 'service_p95_ms_mean' in self.df.columns
             and not self.df['service_p95_ms_mean'].isna().all()
+        )
+
+        # True if this run has broker overhead columns (post second
+        # methodology iteration). Drives plot_broker_overhead.
+        self.has_broker_latency = (
+            self.is_aggregated
+            and 'broker_p95_ms_mean' in self.df.columns
+            and not self.df['broker_p95_ms_mean'].isna().all()
         )
 
         # CPU column
@@ -607,6 +623,122 @@ class GraphGenerator:
         print("Saved: service_vs_e2e_latency.png")
         plt.close()
 
+    def plot_broker_overhead(self):
+        """Broker overhead per message — the fair infrastructure-cost metric.
+
+        broker_ms_per_message = (cycle_time - N × processing_time) / N
+
+        Unlike service_ms, this does NOT penalize batched backends by
+        batch position. Shows the infrastructure's actual contribution.
+        """
+        if not self.has_broker_latency:
+            print("Skipping: broker_overhead (no broker_* columns; run with "
+                  "updated workers)")
+            return
+
+        fig, axes = plt.subplots(3, 3, figsize=(18, 13))
+        fig.suptitle('Broker overhead per message (log scale)\n'
+                     'Infrastructure cost only — processing time subtracted, '
+                     'amortized across batches. Lower is better.',
+                     fontsize=13, fontweight='bold', y=1.005)
+        scenarios = ['cold', 'warm', 'load']
+        percentiles = ['p50', 'p95', 'p99']
+
+        for row_idx, scenario in enumerate(scenarios):
+            for col_idx, pct in enumerate(percentiles):
+                ax = axes[row_idx, col_idx]
+                col = self.lat_cols[f'broker_{pct}']
+                data = self.df[self.df['scenario'] == scenario].sort_values(col)
+                data = data[data[col].notna()] if col in self.df.columns else data
+
+                if data.empty:
+                    ax.axis('off')
+                    continue
+
+                y = np.arange(len(data))
+                vals = data[col].values
+                colors = self._get_colors(data['backend'])
+
+                xerr = self._err_deltas(
+                    data, col,
+                    self.lat_cols.get(f'broker_{pct}_ci_lo'),
+                    self.lat_cols.get(f'broker_{pct}_ci_hi'),
+                    self.lat_cols.get(f'broker_{pct}_err'),
+                )
+
+                bars = ax.barh(y, vals, color=colors, alpha=0.85,
+                               xerr=xerr, capsize=3)
+                ax.set_yticks(y)
+                ax.set_yticklabels(data['label'], fontsize=8)
+                ax.set_xlabel('Broker overhead (ms, log scale)', fontsize=9)
+                ax.set_xscale('log')
+                ax.set_title(f'{scenario.title()} — {pct}', fontsize=10, fontweight='bold')
+                ax.grid(axis='x', alpha=0.3, which='both')
+
+                for i, (bar, val) in enumerate(zip(bars, vals)):
+                    ax.text(val * 1.1, bar.get_y() + bar.get_height() / 2,
+                            f'{val:.2f}', ha='left', va='center', fontsize=7)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'broker_overhead.png'),
+                    dpi=300, bbox_inches='tight')
+        print("Saved: broker_overhead.png")
+        plt.close()
+
+    def plot_three_way_latency(self):
+        """Side-by-side e2e vs service vs broker latency for the LOAD scenario.
+
+        This is the companion to service_vs_e2e_latency.png — it shows all
+        three metrics simultaneously so the reader can see:
+          1. The queue-wait gap (e2e - service)
+          2. The batch-position penalty (service - broker)
+          3. The actual infrastructure cost (broker)
+        """
+        if not (self.has_service_latency and self.has_broker_latency):
+            print("Skipping: three_way_latency (need both service_* and broker_*)")
+            return
+
+        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+        fig.suptitle('Three latency definitions per variant — LOAD scenario\n'
+                     'Yellow = broker overhead (fair) · Purple = service (penalizes batching) · Orange = end-to-end (includes queue wait)',
+                     fontsize=13, fontweight='bold', y=1.02)
+        percentiles = ['p50', 'p95', 'p99']
+
+        for col_idx, pct in enumerate(percentiles):
+            ax = axes[col_idx]
+            data = self.df[self.df['scenario'] == 'load'].copy()
+            if data.empty:
+                ax.axis('off')
+                continue
+
+            data = data.sort_values(self.lat_cols[f'broker_{pct}'])
+            y = np.arange(len(data))
+            h = 0.27
+
+            e2e_vals = data[self.lat_cols[pct]].fillna(0).values
+            svc_vals = data[self.lat_cols[f'service_{pct}']].fillna(0).values
+            brk_vals = data[self.lat_cols[f'broker_{pct}']].fillna(0).values
+
+            ax.barh(y + h, e2e_vals, h, color=COLOR_E2E, alpha=0.85, label='End-to-end')
+            ax.barh(y, svc_vals, h, color=COLOR_SERVICE, alpha=0.85, label='Service')
+            ax.barh(y - h, brk_vals, h, color=COLOR_BROKER, alpha=0.9, label='Broker')
+
+            ax.set_yticks(y)
+            ax.set_yticklabels(data['label'], fontsize=8)
+            ax.set_xlabel('Latency (ms, log scale)', fontsize=9)
+            ax.set_xscale('log')
+            ax.set_title(f'{pct}', fontsize=11, fontweight='bold')
+            ax.grid(axis='x', alpha=0.3, which='both')
+
+            if col_idx == 2:
+                ax.legend(loc='lower right', fontsize=8)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'three_way_latency.png'),
+                    dpi=300, bbox_inches='tight')
+        print("Saved: three_way_latency.png")
+        plt.close()
+
     def plot_decision_guide(self):
         """Visual decision guide across 4 backends.
 
@@ -679,6 +811,8 @@ class GraphGenerator:
         self.plot_throughput_comparison()
         self.plot_latency_comparison()
         self.plot_service_vs_e2e()
+        self.plot_broker_overhead()
+        self.plot_three_way_latency()
         self.plot_latency_distribution()
         self.plot_cpu_usage()
         self.plot_scenario_comparison()
